@@ -18,7 +18,11 @@ importers:
         specifier: ^2
         version: 2.1.9(@types/node@20.19.43)
 
-  packages/core: {}
+  packages/core:
+    dependencies:
+      '@tez/shared':
+        specifier: workspace:*
+        version: link:../shared
 
   packages/robot-interface:
     dependencies:
