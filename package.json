@@ -1,0 +1,15 @@
+{
+  "name": "tez-robotics-orchestrator",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Tez Robotics - Orchestrator Core Monorepo",
+  "private": true,
+  "devDependencies": {
+    "@types/node": "^20",
+    "typescript": "^5.5",
+    "vitest": "^2"
+  },
+  "scripts": {
+    "test": "vitest run --run"
+  }
+}
