@@ -70,6 +70,22 @@ function parseMissionId(missionId: string): { orderId: string; leg: "pick" | "dr
  *   4. dispatch idle robots x queued orders (Hungarian)
  *   5. PIBT step for all routable robots; extend/send missions for active
  *      legs; reservation claim as a contention-detecting safety net
+ *
+ * IMPORTANT — v1 lockstep precondition (see task-10-report.md §5): the
+ * "no two robots ever share a cell" guarantee comes entirely from PIBT's
+ * `step()` being called once per tick over the FULL set of currently
+ * routable robots' TRUE current positions. That only holds when robot
+ * position updates and orchestrator ticks are interleaved in lockstep —
+ * exactly what the FakeAdapter-driven tests do (`adapter.tick()` then
+ * `orchestrator.tickOnce()`, one full step at a time). A real adapter
+ * (vda5050/seer-tcp) driven by `start()`'s wall-clock `setInterval` has no
+ * such guarantee: telemetry can arrive at any cadence relative to
+ * `tickMs`, so a robot's reported position may already be multiple cells
+ * stale (or ahead) by the time `runRouting()` reads it, which the current
+ * "claim just [current, next]" reservation gate does not protect against.
+ * Do not rely on the collision invariant for a real-adapter deployment
+ * until proper horizon-gating (see `opts.horizon`) lands — tracked as a
+ * follow-up for Task 11/12.
  */
 export class Orchestrator {
   private readonly map: WarehouseMap;
@@ -171,14 +187,23 @@ export class Orchestrator {
   // ---- tick pipeline -----------------------------------------------------
 
   private runTick(): void {
-    this.tickCount++;
-    const events = this.eventQueue.splice(0, this.eventQueue.length);
-    for (const ev of events) this.handleEvent(ev);
+    // Top-level guard: this runs off a bare setInterval callback in
+    // start(), so an uncaught exception here would otherwise be an
+    // unhandled error that can crash the process. Log and skip the rest of
+    // this tick rather than taking the whole fleet down; the next tick
+    // gets a fresh chance.
+    try {
+      this.tickCount++;
+      const events = this.eventQueue.splice(0, this.eventQueue.length);
+      for (const ev of events) this.handleEvent(ev);
 
-    this.resolveCurrentNodes();
-    this.handleOfflineTimeouts();
-    this.runDispatch();
-    this.runRouting();
+      this.resolveCurrentNodes();
+      this.handleOfflineTimeouts();
+      this.runDispatch();
+      this.runRouting();
+    } catch (err) {
+      this.alarms.push(`t=${this.tickCount} tick threw: ${String(err)}`);
+    }
   }
 
   private handleEvent(e: AdapterEvent): void {
@@ -222,8 +247,43 @@ export class Orchestrator {
     }
   }
 
-  private findOrder(id: string): TransportOrder | undefined {
-    return this.allOrders.find((o) => o.id === id);
+  /**
+   * Stale-reporter guard (C1): both missionDone and missionFailed must only
+   * be allowed to drive an order's lifecycle when the reporting robot is
+   * that order's CURRENT holder per the order book — not merely "some
+   * robot that once had a mission with this id". Without this, a robot
+   * that went offline mid-leg, had its order requeued and reassigned to a
+   * different robot, and then revived and finished its now-orphaned
+   * mission (cancelMission is only best-effort — it cannot actually reach
+   * an unreachable robot) would drive the REPLACEMENT robot's order
+   * through a lifecycle transition it never earned, corrupting
+   * order.robotId and leaving the real assignee's leg permanently stuck.
+   *
+   * Returns the live order object when `robotId` is confirmed to be its
+   * current holder and its id matches `orderId`; otherwise logs an alarm,
+   * best-effort cancels whatever the reporting robot thinks it's still
+   * doing, clears its (already-stale) local leg bookkeeping so it falls
+   * back into the dispatch pool, and returns undefined.
+   */
+  private verifyReportingRobot(
+    robotId: RobotId,
+    rt: RobotRuntime,
+    orderId: string,
+    kind: "missionDone" | "missionFailed"
+  ): TransportOrder | undefined {
+    const activeOrder = this.book.byRobot(asCoreRobotId(robotId));
+    if (activeOrder && activeOrder.id === orderId) {
+      return activeOrder;
+    }
+    this.alarms.push(
+      `t=${this.tickCount} stale ${kind} from robot ${robotId} for order ${orderId} — ` +
+        `not its current order, ignoring (order not advanced)`
+    );
+    void this.adapter.cancelMission(robotId).catch(() => {
+      /* best-effort; robot may be unreachable, which is exactly why this fired */
+    });
+    rt.leg = undefined;
+    return undefined;
   }
 
   private handleMissionDone(robotId: RobotId, missionId: string): void {
@@ -233,14 +293,15 @@ export class Orchestrator {
     if (!parsed) return;
     const { orderId, leg } = parsed;
 
+    const order = this.verifyReportingRobot(robotId, rt, orderId, "missionDone");
+    if (!order) return;
+
     if (leg === "pick") {
       try {
         this.book.transition(orderId, "underway", "pickup complete");
       } catch {
         return; // stale/duplicate event for an order no longer in this state
       }
-      const order = this.findOrder(orderId);
-      if (!order) return;
       rt.leg = {
         orderId,
         phase: "drop",
@@ -255,12 +316,9 @@ export class Orchestrator {
       } catch {
         return;
       }
-      const order = this.findOrder(orderId);
-      if (order) {
-        const cycleMs = this.nowMs() - Date.parse(order.createdAt);
-        this.cycleTimes.push(cycleMs);
-        this.completions++;
-      }
+      const cycleMs = this.nowMs() - Date.parse(order.createdAt);
+      this.cycleTimes.push(cycleMs);
+      this.completions++;
       rt.leg = undefined;
     }
   }
@@ -269,13 +327,23 @@ export class Orchestrator {
     const rt = this.robots.get(robotId);
     if (!rt) return;
     const parsed = parseMissionId(missionId);
-    const orderId = parsed?.orderId ?? rt.leg?.orderId;
-    if (orderId) {
-      try {
-        this.book.requeue(orderId, reason);
-      } catch {
-        // already terminal / stale — nothing to do
-      }
+    if (!parsed) {
+      // Can't even tell which order this was for; just stop this robot
+      // driving anything further and log it.
+      rt.leg = undefined;
+      this.alarms.push(
+        `t=${this.tickCount} missionFailed from robot ${robotId} with unparseable mission id "${missionId}": ${reason}`
+      );
+      return;
+    }
+
+    const order = this.verifyReportingRobot(robotId, rt, parsed.orderId, "missionFailed");
+    if (!order) return;
+
+    try {
+      this.book.requeue(parsed.orderId, reason);
+    } catch {
+      // already terminal / stale — nothing to do
     }
     this.reservations.releaseAll(robotId);
     rt.leg = undefined;
@@ -305,6 +373,14 @@ export class Orchestrator {
           }
           this.reservations.releaseAll(id);
           rt.leg = undefined;
+          // Best-effort: stop it executing whatever stale mission it still
+          // thinks it has, so it doesn't quietly finish that mission later
+          // (feeding the same stale-report class of bug the C1 guard
+          // handles) and so a reused mission id on un-quarantine doesn't
+          // hit the adapter's non-prefix-extension rejection.
+          void this.adapter.cancelMission(id).catch(() => {
+            /* best-effort; robot may be unreachable */
+          });
         }
         continue;
       }
@@ -399,6 +475,14 @@ export class Orchestrator {
     }
   }
 
+  /**
+   * LOCKSTEP PRECONDITION: the zero-collision guarantee below rests
+   * entirely on `this.router.step()` being called once per tick over every
+   * robot's TRUE current position, with robot movement and orchestrator
+   * ticks interleaved one-for-one (see the class-level doc comment). Under
+   * a wall-clock `start()` timer against a real adapter, that assumption
+   * does not automatically hold — flagged as a Task 11/12 follow-up.
+   */
   private runRouting(): void {
     const agents: Agent[] = [];
     for (const [id, rt] of this.robots) {
