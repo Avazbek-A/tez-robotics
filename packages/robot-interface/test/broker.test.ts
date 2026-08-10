@@ -95,6 +95,56 @@ describe('MQTT Broker - Dev (Local aedes)', () => {
       });
     });
   });
+
+  it('should complete pub/sub roundtrip over WebSocket within 2s', async ({ expect }) => {
+    const client = mqtt.connect(devBroker.wsUrl, {
+      connectTimeout: CONNECT_TIMEOUT,
+    });
+
+    return new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        client.end(true);
+        reject(new Error('Dev broker WS roundtrip timeout - no response within 2s'));
+      }, 2000);
+
+      let messageReceived = false;
+
+      client.on('connect', () => {
+        client.subscribe('test/ping-ws', (err) => {
+          if (err) {
+            clearTimeout(timeout);
+            client.end(true);
+            reject(err);
+            return;
+          }
+
+          // Publish a test message
+          client.publish('test/ping-ws', 'pong-ws', (err) => {
+            if (err) {
+              clearTimeout(timeout);
+              client.end(true);
+              reject(err);
+            }
+          });
+        });
+      });
+
+      client.on('message', (topic, message) => {
+        if (topic === 'test/ping-ws' && message.toString() === 'pong-ws' && !messageReceived) {
+          messageReceived = true;
+          clearTimeout(timeout);
+          client.end(true);
+          resolve();
+        }
+      });
+
+      client.on('error', (error) => {
+        clearTimeout(timeout);
+        client.end(true);
+        reject(error);
+      });
+    });
+  });
 });
 
 describe('MQTT Broker - External (Real Mosquitto)', async () => {

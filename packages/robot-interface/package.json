@@ -12,6 +12,7 @@
   },
   "devDependencies": {
     "aedes": "^0.50",
-    "ws": "^8"
+    "ws": "^8",
+    "websocket-stream": "^5"
   }
 }
