@@ -54,29 +54,46 @@ export class FakeAdapter implements RobotAdapter {
 
     // Check if this is an extension of an existing mission
     if (robot.mission && robot.mission.id === m.id) {
-      // Extension: robot is currently at nodeIds[currentNodeIndex]
-      const currentNodeId = robot.mission.nodeIds[robot.currentNodeIndex];
-      robot.mission.nodeIds = m.nodeIds;
-      // Find where currentNodeId is in the new nodeIds
-      const newIndex = m.nodeIds.indexOf(currentNodeId);
-      if (newIndex >= 0) {
-        robot.currentNodeIndex = newIndex;
+      // Extension: validate prefix and preserve position
+      const oldNodeIds = robot.mission.nodeIds;
+
+      // Validate: new length must be > old length
+      if (m.nodeIds.length <= oldNodeIds.length) {
+        throw new Error(
+          `invalid mission extension: new nodeIds must be longer than current (got ${m.nodeIds.length}, need > ${oldNodeIds.length})`
+        );
       }
+
+      // Validate: new nodeIds must be strict prefix extension of old
+      for (let i = 0; i < oldNodeIds.length; i++) {
+        if (oldNodeIds[i] !== m.nodeIds[i]) {
+          throw new Error(
+            `invalid mission extension: new nodeIds must preserve existing path. Mismatch at index ${i}: was "${oldNodeIds[i]}", now "${m.nodeIds[i]}"`
+          );
+        }
+      }
+
+      // Valid extension: update path but preserve position and current pos
+      robot.mission.nodeIds = m.nodeIds;
+      // currentNodeIndex stays the same - robot continues from current position
+      robot.state.lastSeen = new Date().toISOString();
     } else {
-      // New mission
+      // New mission: set up fresh
       robot.mission = {
         id: m.id,
         nodeIds: m.nodeIds,
       };
       robot.currentNodeIndex = 0;
+
+      // Only for new missions, set pos from first node
+      const node = map.node(m.nodeIds[0]);
+      robot.state.pos = node.pos;
+      robot.state.lastSeen = new Date().toISOString();
     }
 
-    // Update robot state
-    const node = map.node(m.nodeIds[0]);
-    robot.state.pos = node.pos;
+    // Common to both: set status to EXECUTING and current mission ID
     robot.state.status = "EXECUTING";
     robot.state.currentMissionId = m.id;
-    robot.state.lastSeen = new Date().toISOString();
   }
 
   async cancelMission(robotId: RobotId): Promise<void> {

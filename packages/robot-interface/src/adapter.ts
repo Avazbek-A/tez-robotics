@@ -17,7 +17,19 @@ export type AdapterEvent =
 export interface RobotAdapter {
   start(): Promise<void>;
   stop(): Promise<void>;
-  sendMission(m: Mission, map: WarehouseMap): Promise<void>; // extend = same mission id, longer nodeIds
+  /**
+   * Send or extend a mission.
+   * - New mission (new id): robot starts at first node, currentIndex=0
+   * - Extension (same id): validates strict prefix extension; preserves robot position and currentIndex
+   * @throws on invalid extension (shorter path or mismatched prefix)
+   */
+  sendMission(m: Mission, map: WarehouseMap): Promise<void>;
   cancelMission(robotId: RobotId): Promise<void>;
+  /**
+   * Subscribe to adapter events.
+   * EventEmitter-style no-dedup: same handler added twice receives duplicates.
+   * Per-tick contract: mission events (missionProgress, missionDone) fire BEFORE heartbeat state.
+   * missionDone fires on the tick AFTER final node reached (N-node mission completes on tick N).
+   */
   on(handler: (e: AdapterEvent) => void): void;
 }

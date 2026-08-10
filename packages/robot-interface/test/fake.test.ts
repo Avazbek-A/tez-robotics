@@ -156,7 +156,7 @@ describe("FakeAdapter", () => {
       const mission2: Mission = {
         id: "m1", // same id
         robotId: "r1",
-        nodeIds: ["n1", "n2"], // extended path
+        nodeIds: ["n0", "n1", "n2"], // strict prefix extension
       };
       await adapter.sendMission(mission2, map);
 
@@ -166,6 +166,109 @@ describe("FakeAdapter", () => {
       if (stateEvent?.type === "state") {
         expect(stateEvent.state.pos).toEqual({ x: 2, y: 0 });
       }
+
+      await adapter.stop();
+    });
+
+    it("should preserve robot position on mid-mission extension", async () => {
+      // Create a larger map for this test: n0 -> n1 -> n2 -> n3 -> n4
+      const largerMap = WarehouseMap.fromJSON({
+        nodes: [
+          { id: "n0", pos: { x: 0, y: 0 } },
+          { id: "n1", pos: { x: 1, y: 0 } },
+          { id: "n2", pos: { x: 2, y: 0 } },
+          { id: "n3", pos: { x: 3, y: 0 } },
+          { id: "n4", pos: { x: 4, y: 0 } },
+        ],
+        edges: [
+          { from: "n0", to: "n1", bidirectional: true },
+          { from: "n1", to: "n2", bidirectional: true },
+          { from: "n2", to: "n3", bidirectional: true },
+          { from: "n3", to: "n4", bidirectional: true },
+        ],
+      });
+
+      const mission1: Mission = {
+        id: "m1",
+        robotId: "r1",
+        nodeIds: ["n0", "n1", "n2"],
+      };
+
+      const events: AdapterEvent[] = [];
+      adapter.on((e: AdapterEvent) => events.push(e));
+
+      await adapter.start();
+      await adapter.sendMission(mission1, largerMap);
+
+      // Advance to n1
+      adapter.tick();
+      events.length = 0;
+
+      // Record position before extension
+      const robotsBeforeExtend = adapter.robots();
+      const posBeforeExtend = robotsBeforeExtend[0].pos;
+
+      // Extend mission with more nodes
+      const mission2: Mission = {
+        id: "m1",
+        robotId: "r1",
+        nodeIds: ["n0", "n1", "n2", "n3", "n4"], // longer path, same prefix
+      };
+      await adapter.sendMission(mission2, largerMap);
+
+      // Position should NOT change on extension
+      const robotsAfterExtend = adapter.robots();
+      expect(robotsAfterExtend[0].pos).toEqual(posBeforeExtend);
+
+      await adapter.stop();
+    });
+
+    it("should reject extension with shorter nodeIds", async () => {
+      const mission1: Mission = {
+        id: "m1",
+        robotId: "r1",
+        nodeIds: ["n0", "n1", "n2"],
+      };
+
+      await adapter.start();
+      await adapter.sendMission(mission1, map);
+      adapter.tick();
+
+      // Try to extend with shorter array
+      const shorterMission: Mission = {
+        id: "m1",
+        robotId: "r1",
+        nodeIds: ["n0", "n1"], // shorter!
+      };
+
+      await expect(adapter.sendMission(shorterMission, map)).rejects.toThrow(
+        "invalid mission extension"
+      );
+
+      await adapter.stop();
+    });
+
+    it("should reject extension with mismatched prefix", async () => {
+      const mission1: Mission = {
+        id: "m1",
+        robotId: "r1",
+        nodeIds: ["n0", "n1", "n2"],
+      };
+
+      await adapter.start();
+      await adapter.sendMission(mission1, map);
+      adapter.tick();
+
+      // Try to extend with different path
+      const mismatchedMission: Mission = {
+        id: "m1",
+        robotId: "r1",
+        nodeIds: ["n1", "n2"], // mismatched prefix!
+      };
+
+      await expect(adapter.sendMission(mismatchedMission, map)).rejects.toThrow(
+        "invalid mission extension"
+      );
 
       await adapter.stop();
     });
@@ -259,6 +362,30 @@ describe("FakeAdapter", () => {
       expect(events1.length).toBeGreaterThan(0);
       expect(events2.length).toBeGreaterThan(0);
       expect(events1.length).toBe(events2.length);
+
+      await adapter.stop();
+    });
+
+    it("should use EventEmitter-style no-dedup (same handler added twice receives duplicates)", async () => {
+      const mission: Mission = {
+        id: "m1",
+        robotId: "r1",
+        nodeIds: ["n0", "n1"],
+      };
+
+      const events: AdapterEvent[] = [];
+      const handler = (e: AdapterEvent) => events.push(e);
+
+      adapter.on(handler);
+      adapter.on(handler); // add same handler twice
+
+      await adapter.start();
+      await adapter.sendMission(mission, map);
+      adapter.tick();
+
+      // Events should be received twice by the duplicate handler
+      const stateEvents = events.filter((e) => e.type === "state");
+      expect(stateEvents.length).toBe(2); // duplicated
 
       await adapter.stop();
     });
