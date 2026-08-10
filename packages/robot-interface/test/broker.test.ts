@@ -1,12 +1,13 @@
-import { describe, it, beforeAll } from 'vitest';
+import { describe, it, beforeAll, afterAll } from 'vitest';
 import * as mqtt from 'mqtt';
+import { startDevBroker, type DevBrokerResult } from '../src/dev-broker';
 
-const MQTT_URL = process.env.MQTT_URL || 'mqtt://localhost:1883';
+const EXTERNAL_MQTT_URL = process.env.MQTT_URL || 'mqtt://localhost:1883';
 const CONNECT_TIMEOUT = 500;
 
-async function isBrokerUp(): Promise<boolean> {
+async function isBrokerReachable(url: string): Promise<boolean> {
   return new Promise((resolve) => {
-    const client = mqtt.connect(MQTT_URL, {
+    const client = mqtt.connect(url, {
       connectTimeout: CONNECT_TIMEOUT,
       reconnectPeriod: 0,
     });
@@ -30,28 +31,96 @@ async function isBrokerUp(): Promise<boolean> {
   });
 }
 
-describe('MQTT Broker', () => {
-  let brokerUp = false;
-  let skipBroker = false;
+describe('MQTT Broker - Dev (Local aedes)', () => {
+  let devBroker: DevBrokerResult;
 
   beforeAll(async () => {
-    brokerUp = await isBrokerUp();
-    skipBroker = !process.env.CI && !brokerUp;
+    devBroker = await startDevBroker();
+    console.log(`Dev broker started on ${devBroker.url}`);
   });
 
-  it.skipIf(skipBroker)(
-    'should complete pub/sub roundtrip on test/ping topic within 2s',
-    async ({ expect }) => {
-      expect(brokerUp).toBe(true);
+  afterAll(async () => {
+    if (devBroker) {
+      await devBroker.close();
+      console.log('Dev broker closed');
+    }
+  });
 
-      const client = mqtt.connect(MQTT_URL, {
+  it('should complete pub/sub roundtrip on test/ping topic within 2s', async ({ expect }) => {
+    const client = mqtt.connect(devBroker.url, {
+      connectTimeout: CONNECT_TIMEOUT,
+    });
+
+    return new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        client.end(true);
+        reject(new Error('Dev broker roundtrip timeout - no response within 2s'));
+      }, 2000);
+
+      let messageReceived = false;
+
+      client.on('connect', () => {
+        client.subscribe('test/ping', (err) => {
+          if (err) {
+            clearTimeout(timeout);
+            client.end(true);
+            reject(err);
+            return;
+          }
+
+          // Publish a test message
+          client.publish('test/ping', 'pong', (err) => {
+            if (err) {
+              clearTimeout(timeout);
+              client.end(true);
+              reject(err);
+            }
+          });
+        });
+      });
+
+      client.on('message', (topic, message) => {
+        if (topic === 'test/ping' && message.toString() === 'pong' && !messageReceived) {
+          messageReceived = true;
+          clearTimeout(timeout);
+          client.end(true);
+          resolve();
+        }
+      });
+
+      client.on('error', (error) => {
+        clearTimeout(timeout);
+        client.end(true);
+        reject(error);
+      });
+    });
+  });
+});
+
+describe('MQTT Broker - External (Real Mosquitto)', async () => {
+  const externalBrokerAvailable = await isBrokerReachable(EXTERNAL_MQTT_URL);
+  const skipExternal = !externalBrokerAvailable;
+
+  if (skipExternal) {
+    console.warn(
+      `External broker unreachable at ${EXTERNAL_MQTT_URL} - skipping external broker test. ` +
+        'Set MQTT_URL env var or start Mosquitto to test real broker integration.',
+    );
+    it.skip('should complete pub/sub roundtrip against external broker within 2s', async () => {
+      // Test skipped - external broker not available
+    });
+  } else {
+    it('should complete pub/sub roundtrip against external broker within 2s', async ({ expect }) => {
+      expect(externalBrokerAvailable).toBe(true);
+
+      const client = mqtt.connect(EXTERNAL_MQTT_URL, {
         connectTimeout: CONNECT_TIMEOUT,
       });
 
       return new Promise<void>((resolve, reject) => {
         const timeout = setTimeout(() => {
-          client.end();
-          reject(new Error('Broker roundtrip timeout - no response within 2s'));
+          client.end(true);
+          reject(new Error('External broker roundtrip timeout - no response within 2s'));
         }, 2000);
 
         let messageReceived = false;
@@ -60,7 +129,7 @@ describe('MQTT Broker', () => {
           client.subscribe('test/ping', (err) => {
             if (err) {
               clearTimeout(timeout);
-              client.end();
+              client.end(true);
               reject(err);
               return;
             }
@@ -69,7 +138,7 @@ describe('MQTT Broker', () => {
             client.publish('test/ping', 'pong', (err) => {
               if (err) {
                 clearTimeout(timeout);
-                client.end();
+                client.end(true);
                 reject(err);
               }
             });
@@ -80,17 +149,17 @@ describe('MQTT Broker', () => {
           if (topic === 'test/ping' && message.toString() === 'pong' && !messageReceived) {
             messageReceived = true;
             clearTimeout(timeout);
-            client.end();
+            client.end(true);
             resolve();
           }
         });
 
         client.on('error', (error) => {
           clearTimeout(timeout);
-          client.end();
+          client.end(true);
           reject(error);
         });
       });
-    },
-  );
+    });
+  }
 });
