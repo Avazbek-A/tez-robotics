@@ -8,7 +8,8 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
-    "mqtt": "^5"
+    "mqtt": "^5",
+    "vda-5050-lib": "^1.7"
   },
   "devDependencies": {
     "aedes": "^0.50",
