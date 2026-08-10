@@ -703,4 +703,153 @@ describe("Orchestrator", () => {
       expect(afterOrder?.status).toBe("completed");
     });
   });
+
+  describe("round-3 regression: re-quarantine after later drift off-grid", () => {
+    it("quarantines a robot that resolved once and later reports an unresolvable position", () => {
+      // Regression test for a round-3 review finding: the batch-freshness
+      // fix (I1) made resolveCurrentNodes() treat an already-set
+      // rt.currentNodeId as sticky ("resolved this batch, don't
+      // re-derive"), but the "state" event handler only assigned a FRESH
+      // snap result when it resolved to a valid node — on an unresolvable
+      // snap it left the old (stale, still-valid-looking) node id in
+      // place. A robot that resolved once and later genuinely drifted
+      // off-grid would keep that stale valid node forever and never get
+      // quarantined. Fixed by always assigning the snap result in the
+      // "state" handler, including `undefined`.
+      const map = grid(3);
+      const adapter = new ScriptableAdapter([{ id: "r1", startNodeId: "n0_0" }], map);
+      const clock = fakeClock();
+      const orchestrator = new Orchestrator(map, adapter, { now: clock.now });
+
+      // Tick 1: normal heartbeat at a valid node — resolves fine, no
+      // quarantine.
+      adapter.tick();
+      orchestrator.tickOnce();
+      const afterTick1 = orchestrator.snapshot().robots.find((r) => r.id === "r1");
+      expect(afterTick1).toBeDefined();
+      expect(afterTick1?.status).not.toBe("ERROR");
+      expect(orchestrator.getAlarms().some((a) => a.includes("quarantined"))).toBe(false);
+
+      // Tick 2: the robot reports an off-grid position — nothing in the
+      // map resolves to it.
+      adapter.injectEvent({
+        type: "state",
+        state: { ...afterTick1!, pos: { x: 99, y: 99 } },
+      });
+      orchestrator.tickOnce();
+
+      const afterTick2 = orchestrator.snapshot().robots.find((r) => r.id === "r1");
+      expect(afterTick2?.status).toBe("ERROR");
+      expect(
+        orchestrator.getAlarms().some((a) => a.includes("quarantined") && a.includes("r1"))
+      ).toBe(true);
+    });
+  });
+
+  describe("round-3 regression: lastVdaNodeId does not leak across legs", () => {
+    it("does not let a stale VDA lastNodeId from a completed leg wrongly satisfy a different leg's premature-done guard", () => {
+      // Regression test for a round-3 review finding: rt.lastVdaNodeId was
+      // written by missionProgress events but never reset, so a value
+      // confirmed for a PREVIOUS leg persisted indefinitely. If a LATER,
+      // unrelated leg's goal node happened to coincide with that stale
+      // value, handleMissionDone's frontier-race guard would wrongly
+      // accept a premature "done" for the new leg even though the robot
+      // hadn't made any progress on it. Fixed by routing every rt.leg
+      // assignment/clear through a setLeg() helper that also resets
+      // rt.lastVdaNodeId.
+      //
+      // Fully scripted (not relying on organic step()-driven movement for
+      // the critical portion): a real, organically-simulated journey
+      // naturally overwrites rt.lastVdaNodeId with fresh, LEGITIMATE
+      // missionProgress along the way — which would dilute the exact
+      // coincidence being tested before it could ever manifest. Scripting
+      // it directly reproduces the review's precise repro: "A drops at
+      // n2_2, B targets n2_2, robot at n0_1, early done for B".
+      const map = grid(5);
+      const adapter = new ScriptableAdapter([{ id: "r1", startNodeId: "n0_0" }], map);
+      const clock = fakeClock();
+      const orchestrator = new Orchestrator(map, adapter, { now: clock.now });
+
+      const orderA = orchestrator.submitOrder("n1_0", "n2_2");
+      let aUnderway = false;
+      for (let i = 0; i < 20 && !aUnderway; i++) {
+        step(orchestrator, adapter);
+        const found = orchestrator.snapshot().orders.find((o) => o.id === orderA.id);
+        aUnderway = found?.status === "underway";
+      }
+      expect(aUnderway).toBe(true);
+
+      // Script A's drop leg reaching its goal directly: a missionProgress
+      // confirming n2_2 (setting rt.lastVdaNodeId = "n2_2"), then the
+      // matching missionDone — a legitimate completion by the guard's own
+      // rules.
+      adapter.injectEvent({
+        type: "missionProgress",
+        robotId: "r1",
+        missionId: `${orderA.id}:drop`,
+        lastNodeId: "n2_2",
+      });
+      adapter.injectEvent({
+        type: "missionDone",
+        robotId: "r1",
+        missionId: `${orderA.id}:drop`,
+      });
+      orchestrator.tickOnce();
+      const afterA = orchestrator.snapshot().orders.find((o) => o.id === orderA.id);
+      expect(afterA?.status).toBe("completed");
+
+      // Order B also drops at n2_2 — the SAME node A just legitimately
+      // reached. Single-robot fleet forces it onto r1 too.
+      const orderB = orchestrator.submitOrder("n0_1", "n2_2");
+      orchestrator.tickOnce(); // dispatch assigns B's pick leg to the now-idle r1
+      const dispatched = orchestrator.snapshot().orders.find((o) => o.id === orderB.id);
+      expect(dispatched?.status).toBe("dispatched");
+      expect(dispatched?.robotId).toBe("r1");
+
+      // Script B's pick leg completing WITHOUT any missionProgress event —
+      // a legitimate possibility (e.g. a short pick leg), and exactly the
+      // case where, pre-fix, nothing would have overwritten A's stale
+      // "n2_2" left in rt.lastVdaNodeId.
+      const r1Now = orchestrator.snapshot().robots.find((r) => r.id === "r1")!;
+      adapter.injectEvent({
+        type: "state",
+        state: { ...r1Now, pos: map.node("n0_1").pos },
+      });
+      adapter.injectEvent({
+        type: "missionDone",
+        robotId: "r1",
+        missionId: `${orderB.id}:pick`,
+      });
+      orchestrator.tickOnce();
+      const afterPick = orchestrator.snapshot().orders.find((o) => o.id === orderB.id);
+      expect(afterPick?.status).toBe("underway");
+
+      // B's drop leg is now active (goalNode = n2_2, coinciding with A's
+      // old goal). Report the robot's actual position as demonstrably
+      // elsewhere (n0_1, matching the review's repro) — no
+      // missionProgress for this leg — then inject a premature done.
+      // Without the leg-scoped reset, the stale rt.lastVdaNodeId === "n2_2"
+      // left over from A's drop leg would wrongly satisfy the guard and
+      // this would be silently accepted as a legitimate completion.
+      const r1AtPickup = orchestrator.snapshot().robots.find((r) => r.id === "r1")!;
+      expect(r1AtPickup.pos).toEqual(map.node("n0_1").pos);
+      adapter.injectEvent({
+        type: "state",
+        state: { ...r1AtPickup, pos: map.node("n0_1").pos },
+      });
+      adapter.injectEvent({
+        type: "missionDone",
+        robotId: "r1",
+        missionId: `${orderB.id}:drop`,
+      });
+      orchestrator.tickOnce();
+
+      expect(
+        orchestrator.getAlarms().some((a) => a.includes("premature missionDone") && a.includes("r1"))
+      ).toBe(true);
+      const afterEarlyDone = orchestrator.snapshot().orders.find((o) => o.id === orderB.id);
+      expect(afterEarlyDone?.status).not.toBe("completed");
+      expect(afterEarlyDone?.retries).toBeGreaterThanOrEqual(1);
+    });
+  });
 });

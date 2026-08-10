@@ -72,6 +72,29 @@ function parseMissionId(missionId: string): { orderId: string; leg: "pick" | "dr
 }
 
 /**
+ * The ONLY place `rt.leg` is allowed to be assigned (new leg started) or
+ * cleared (leg aborted/completed) — every such site in this file must call
+ * this instead of assigning `rt.leg` directly. It resets
+ * `rt.lastVdaNodeId` on every transition.
+ *
+ * Why: `lastVdaNodeId` is written by `missionProgress` events and read by
+ * `handleMissionDone`'s frontier-race guard as "has the robot reached the
+ * CURRENT leg's goal". Without this reset, a value confirmed for a
+ * PREVIOUS leg persists indefinitely (missionProgress only fires on
+ * change, so nothing else would ever clear it) — if a later, unrelated
+ * leg's goal node happens to coincide with (or was already passed en
+ * route to) that old value, the guard would wrongly treat a genuinely
+ * premature "done" for the NEW leg as legitimate, even though the robot
+ * hasn't made any progress on it at all. Scoping `lastVdaNodeId` to reset
+ * on every leg transition ensures the guard only ever sees confirmation
+ * that's about the leg currently being evaluated.
+ */
+function setLeg(rt: RobotRuntime, leg: RobotLeg | undefined): void {
+  rt.leg = leg;
+  rt.lastVdaNodeId = undefined;
+}
+
+/**
  * Orchestrator: wires map + router + reservations + dispatcher + order book
  * + RobotAdapter into a tick loop.
  *
@@ -243,12 +266,16 @@ export class Orchestrator {
         // still see whatever currentNodeId was left over from the END of
         // the PREVIOUS tick, misclassifying a genuinely on-time completion
         // as premature. See handleMissionDone's frontier-race guard.
-        const snapped = this.snapToNode(rt.state.pos);
-        if (snapped !== undefined) {
-          rt.currentNodeId = snapped;
-        }
-        // else: leave currentNodeId as whatever it was; resolveCurrentNodes()'s
-        // end-of-tick fallback/quarantine pass handles the unresolved case.
+        //
+        // ALWAYS assign here, including `undefined` when the position is
+        // unresolvable — do not leave a stale, previously-valid node id in
+        // place. resolveCurrentNodes() treats an already-set
+        // `currentNodeId` as "resolved this batch, don't re-derive" (see
+        // its own doc comment); if we skipped the assignment here on an
+        // unresolvable snap, a robot that resolved once and later drifts
+        // off-grid would keep its old valid node forever and never get
+        // quarantined.
+        rt.currentNodeId = this.snapToNode(rt.state.pos);
         break;
       }
       case "connection": {
@@ -340,7 +367,7 @@ export class Orchestrator {
       void this.adapter.cancelMission(robotId).catch(() => {
         /* best-effort; robot may be unreachable, which is exactly why this fired */
       });
-      rt.leg = undefined;
+      setLeg(rt, undefined);
     }
     return undefined;
   }
@@ -394,7 +421,7 @@ export class Orchestrator {
           /* already terminal */
         }
         this.reservations.releaseAll(robotId);
-        rt.leg = undefined;
+        setLeg(rt, undefined);
         return;
       }
     }
@@ -405,14 +432,14 @@ export class Orchestrator {
       } catch {
         return; // stale/duplicate event for an order no longer in this state
       }
-      rt.leg = {
+      setLeg(rt, {
         orderId,
         phase: "drop",
         goalNode: order.dropNode,
         missionId: `${orderId}:drop`,
         nodeIds: [], // seeded once this tick's current node is resolved
         sent: false,
-      };
+      });
     } else {
       try {
         this.book.transition(orderId, "completed", "drop complete");
@@ -422,7 +449,7 @@ export class Orchestrator {
       const cycleMs = this.nowMs() - Date.parse(order.createdAt);
       this.cycleTimes.push(cycleMs);
       this.completions++;
-      rt.leg = undefined;
+      setLeg(rt, undefined);
     }
   }
 
@@ -433,7 +460,7 @@ export class Orchestrator {
     if (!parsed) {
       // Can't even tell which order this was for; just stop this robot
       // driving anything further and log it.
-      rt.leg = undefined;
+      setLeg(rt, undefined);
       this.alarms.push(
         `t=${this.tickCount} missionFailed from robot ${robotId} with unparseable mission id "${missionId}": ${reason}`
       );
@@ -449,7 +476,7 @@ export class Orchestrator {
       // already terminal / stale — nothing to do
     }
     this.reservations.releaseAll(robotId);
-    rt.leg = undefined;
+    setLeg(rt, undefined);
     this.alarms.push(`t=${this.tickCount} mission failed for robot ${robotId}: ${reason}`);
   }
 
@@ -496,7 +523,7 @@ export class Orchestrator {
             }
           }
           this.reservations.releaseAll(id);
-          rt.leg = undefined;
+          setLeg(rt, undefined);
           // Best-effort: stop it executing whatever stale mission it still
           // thinks it has, so it doesn't quietly finish that mission later
           // (feeding the same stale-report class of bug the stale-reporter
@@ -546,7 +573,7 @@ export class Orchestrator {
         }
       }
       this.reservations.releaseAll(id);
-      rt.leg = undefined;
+      setLeg(rt, undefined);
       void this.adapter.cancelMission(id).catch(() => {
         /* best-effort; robot is unreachable anyway */
       });
@@ -593,14 +620,14 @@ export class Orchestrator {
       const rt = this.robots.get(a.robotId);
       if (!rt || rt.currentNodeId === undefined) continue;
       rt.idleSinceTick = undefined;
-      rt.leg = {
+      setLeg(rt, {
         orderId: order.id,
         phase: "pick",
         goalNode: order.pickupNode,
         missionId: `${order.id}:pick`,
         nodeIds: [rt.currentNodeId],
         sent: false,
-      };
+      });
     }
   }
 
