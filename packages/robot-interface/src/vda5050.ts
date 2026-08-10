@@ -5,6 +5,8 @@ import {
   MasterController,
   BlockingType,
   ConnectionState,
+  ErrorType,
+  ErrorLevel,
   createUuid,
   type AgvId,
   type ClientOptions,
@@ -49,13 +51,39 @@ export interface Vda5050AdapterOpts {
 /**
  * Per-robot bookkeeping for the VDA 5050 order currently mapped to that
  * robot's active `Mission`. Mirrors what `FakeAdapter` tracks internally
- * (`mission.id` + `nodeIds`), plus the VDA-specific `orderUpdateId` counter
- * and a `settled` flag used to dedupe terminal events across the multiple
- * `onOrderProcessed` handlers that a chain of order-update ("stitching")
- * calls installs for the same VDA orderId.
+ * (`mission.id` + `nodeIds`), plus the VDA-specific `orderUpdateId`
+ * counter.
+ *
+ * C1 fix — mission id reuse deadlock: `missionId` (the `RobotAdapter`-level
+ * `Mission.id`) is deliberately decoupled from `vdaOrderId` (the wire-level
+ * VDA `orderId` actually used). Earlier this file used `missionId` directly
+ * as the VDA `orderId`, which deadlocks the moment the SAME `missionId` is
+ * reused after this robot's previous attempt at it was canceled or reached
+ * a terminal outcome — which happens routinely, since `Orchestrator` mints
+ * mission ids as `${orderId}:pick`/`${orderId}:drop` and reuses the exact
+ * same id across retries of the same leg (e.g. a robot cancelled for going
+ * offline, later revived and re-dispatched the same still-queued order). By
+ * the time that reuse happens, the AGV/library already tore down the old
+ * `orderId`'s lifecycle; replaying it (with `orderUpdateId: 0`, or as an
+ * "extension" against stale tracked state) either gets silently rejected
+ * with no forthcoming `onOrderProcessed`, or incorrectly validated as an
+ * extension of an order that no longer exists on the AGV side — both are a
+ * silent deadlock (the orchestrator waits forever for a `missionDone` that
+ * will never come). See `Vda5050Adapter.sendMission`/`cancelMission`/
+ * `handleOrderProcessed` for how a per-(robotId, missionId) attempt counter
+ * mints a fresh `vdaOrderId` on every genuinely-new attempt.
  */
 interface TrackedOrder {
-  orderId: string;
+  /** RobotAdapter-level Mission.id (orchestrator-facing). */
+  missionId: string;
+  /**
+   * Wire-level VDA `orderId` in use for the CURRENT attempt at `missionId`.
+   * Format: `${missionId}#${n}`, where `n` is a per-(robotId, missionId)
+   * attempt counter that survives across cancel/terminal cycles (see
+   * `nextAttemptVdaOrderId`) so a stale in-flight callback from an earlier
+   * attempt can never be mistaken for the current one.
+   */
+  vdaOrderId: string;
   orderUpdateId: number;
   /** Full logical path sent so far, for FakeAdapter-semantic prefix validation. */
   nodeIds: string[];
@@ -73,10 +101,34 @@ interface TrackedOrder {
    * rejected).
    */
   lastSeq: number;
-  settled: boolean;
 }
 
 const MAP_ID = "warehouse";
+
+/**
+ * C2 fix — ERROR status latch: VDA5050 order/instant-action lifecycle
+ * rejection notices (an order was invalid, superseded, or its stitching
+ * didn't line up) are appended to the SAME `state.errors[]` array as
+ * genuine AGV hardware/safety faults — see e.g. `agv-controller.js`'s
+ * `_rejectOrder`/`_createOrderError`. These concern a dead ORDER, not robot
+ * health, and per the library's own error-level semantics an AGV rejecting
+ * one bad order is still "ready to start" (`errorLevel: "WARNING"`), never
+ * `"FATAL"`. Excluded here (by known lifecycle errorType, defensively, and
+ * separately by requiring `errorLevel: "FATAL"`) from the `RobotState.status
+ * = "ERROR"` mapping in `handleState` below — otherwise a single rejected
+ * order permanently latches the robot's reported status at ERROR even after
+ * it's completely idle, healthy, and re-dispatchable.
+ */
+const ORDER_LIFECYCLE_ERROR_TYPES: ReadonlySet<string> = new Set<string>([
+  ErrorType.Order,
+  ErrorType.OrderUpdate,
+  ErrorType.OrderNoRoute,
+  ErrorType.OrderValidation,
+  ErrorType.OrderAction,
+  ErrorType.InstantAction,
+  ErrorType.InstantActionValidation,
+  ErrorType.InstantActionNoOrderToCancel,
+]);
 
 /**
  * RobotAdapter implementation over the real VDA 5050 protocol, built on
@@ -91,25 +143,36 @@ const MAP_ID = "warehouse";
  * RobotId <-> VDA AgvId mapping: `RobotId` (a plain string, per
  * `@tez/shared`) is the AGV's `serialNumber`. The `manufacturer` is fixed
  * per robot at construction time via the `agvIds` list and is otherwise
- * opaque to the rest of the fleet-orchestration code.
+ * opaque to the rest of the fleet-orchestration code. CAVEAT (I2): since
+ * `RobotId` carries no manufacturer component, a multi-manufacturer fleet
+ * where two different manufacturers happen to reuse the same serialNumber
+ * will collide under this scheme (the second one silently maps onto the
+ * first one's RobotId). Configure distinct serialNumbers across
+ * manufacturers, or extend the RobotId mapping, if that's a real risk for a
+ * given deployment — not addressed here.
  *
  * Mission -> VDA order mapping (see `RobotAdapter.sendMission` contract in
- * `adapter.ts`):
- * - `orderId = mission.id`.
- * - New mission id (or no order tracked yet for this robot) -> new VDA
- *   order, `orderUpdateId: 0`.
- * - Same mission id as the currently tracked order, with `mission.nodeIds`
- *   a strict-prefix-longer extension of the previously sent nodeIds (the
- *   exact `FakeAdapter` semantic) -> VDA "stitching order": same `orderId`,
- *   `orderUpdateId` incremented by 1. Per VDA 5050's own stitching-order
- *   rules (confirmed empirically against `agv-controller.js`, see the
- *   `TrackedOrder.lastSeq` doc comment below), the wire order for a
- *   stitching update does NOT resend the full path from node 0 — it repeats
- *   only the previous order's last base node (same nodeId + sequenceId, the
- *   "join point") followed by the newly appended nodes, with sequenceIds
- *   continuing on from there.
- * - Any other same-id nodeIds shape (shorter, or prefix mismatch) throws,
- *   matching the `@throws on invalid extension` contract.
+ * `adapter.ts`). NOTE (C1): the wire-level VDA `orderId` is NOT simply
+ * `mission.id` — see the `TrackedOrder` doc comment above for why that
+ * deadlocks on mission id reuse, and `nextAttemptVdaOrderId` for the actual
+ * `${missionId}#${n}` scheme:
+ * - New mission id (or no LIVE order tracked for this robot under that
+ *   mission id — i.e. the robot's previous attempt at it, if any, was
+ *   already canceled or reached a terminal outcome) -> fresh VDA order,
+ *   `orderUpdateId: 0`, on a freshly-minted `vdaOrderId`.
+ * - Same mission id as the CURRENTLY LIVE tracked order, with
+ *   `mission.nodeIds` a strict-prefix-longer extension of the previously
+ *   sent nodeIds (the exact `FakeAdapter` semantic) -> VDA "stitching
+ *   order" on the SAME `vdaOrderId`, `orderUpdateId` incremented by 1. Per
+ *   VDA 5050's own stitching-order rules (confirmed empirically against
+ *   `agv-controller.js`, see the `TrackedOrder.lastSeq` doc comment above),
+ *   the wire order for a stitching update does NOT resend the full path
+ *   from node 0 — it repeats only the previous order's last base node
+ *   (same nodeId + sequenceId, the "join point") followed by the newly
+ *   appended nodes, with sequenceIds continuing on from there.
+ * - Any other same-missionId nodeIds shape against a currently live order
+ *   (shorter, or prefix mismatch) throws, matching the `@throws on invalid
+ *   extension` contract.
  *
  * Node/edge sequenceIds follow the spike's confirmed even/odd numbering
  * (node i -> `2*i`, edge between node i and i+1 -> `2*i + 1`), offset by
@@ -124,8 +187,18 @@ export class Vda5050Adapter implements RobotAdapter {
   private readonly handlers: Array<(e: AdapterEvent) => void> = [];
 
   private readonly orders = new Map<RobotId, TrackedOrder>();
+  /**
+   * C1: per-(robotId, missionId) attempt counter, keyed `${robotId}::${missionId}`.
+   * Deliberately NEVER cleared (unlike `orders`, which only tracks the
+   * currently-live attempt) — it must keep incrementing across
+   * cancel/terminal cycles so a third attempt at the same missionId gets
+   * `#2`, not a repeat of `#0`.
+   */
+  private readonly attemptCounters = new Map<string, number>();
   private readonly lastNodeIdByRobot = new Map<RobotId, string>();
   private readonly lastPosByRobot = new Map<RobotId, GridPos>();
+  /** I2: serials we've already logged an "unconfigured AGV" warning for, so we log once, not once per heartbeat. */
+  private readonly warnedUnknownRobots = new Set<string>();
   /**
    * Cached from the most recent `sendMission()` call, for snapping reported
    * `agvPosition` readings back onto the map grid in `handleState` — see
@@ -160,13 +233,16 @@ export class Vda5050Adapter implements RobotAdapter {
     await mc.start();
 
     // Single wildcard subscription covers every AGV in this interface
-    // namespace rather than one subscription per robot.
+    // namespace rather than one subscription per robot. I2: this also
+    // means ANY AGV sharing this broker+interfaceName is heard, including
+    // ones outside our configured fleet — filtered out below.
     await mc.subscribe("state", {}, (state, subject) => {
       this.handleState(state, subject);
     });
 
     mc.trackAgvs((subject, connState) => {
       const robotId = subject.serialNumber;
+      if (!this.isConfiguredRobot(robotId)) return; // I2
       this.emit({
         type: "connection",
         robotId,
@@ -190,8 +266,15 @@ export class Vda5050Adapter implements RobotAdapter {
     this.map = map;
 
     const prior = this.orders.get(m.robotId);
-    const isExtension = !!prior && prior.orderId === m.id;
+    // C1: "extension" means the CURRENTLY LIVE tracked order is for this
+    // exact missionId. Because cancelMission() and handleOrderProcessed()
+    // both delete the tracked entry the moment an attempt is canceled or
+    // reaches a terminal outcome (see those methods), `prior` existing at
+    // all with a matching missionId already implies it's the same live
+    // attempt, not a stale one — no separate "settled" flag needed.
+    const isExtension = !!prior && prior.missionId === m.id;
 
+    let vdaOrderId: string;
     let orderUpdateId: number;
     let pathNodeIds: string[]; // nodeIds actually included in THIS wire order, in order
     let startSeq: number;
@@ -200,6 +283,7 @@ export class Vda5050Adapter implements RobotAdapter {
       // prior is defined here (isExtension implies it); narrow for TS.
       const p = prior!;
       orderUpdateId = this.validateExtension(p, m.nodeIds);
+      vdaOrderId = p.vdaOrderId;
       // A VDA 5050 stitching order must repeat the previous order's last
       // base node (same nodeId + sequenceId) as its own first node, then
       // continue with only the newly appended nodes — see the TrackedOrder
@@ -207,7 +291,11 @@ export class Vda5050Adapter implements RobotAdapter {
       pathNodeIds = m.nodeIds.slice(p.nodeIds.length - 1);
       startSeq = p.lastSeq;
     } else {
+      // C1: fresh VDA order under a freshly-minted vdaOrderId — see the
+      // TrackedOrder / class doc comments for why we can't just reuse
+      // missionId (or the previous vdaOrderId) here.
       orderUpdateId = 0;
+      vdaOrderId = this.nextAttemptVdaOrderId(m.robotId, m.id);
       pathNodeIds = m.nodeIds;
       startSeq = 0;
     }
@@ -236,7 +324,7 @@ export class Vda5050Adapter implements RobotAdapter {
     }
 
     const order: Headerless<VdaOrder> = {
-      orderId: m.id,
+      orderId: vdaOrderId,
       orderUpdateId,
       nodes,
       edges,
@@ -250,17 +338,17 @@ export class Vda5050Adapter implements RobotAdapter {
     // against what is actually in flight, not a stale snapshot.
     const previousEntry = prior;
     this.orders.set(m.robotId, {
-      orderId: m.id,
+      missionId: m.id,
+      vdaOrderId,
       orderUpdateId,
       nodeIds: [...m.nodeIds],
       lastSeq,
-      settled: false,
     });
 
     try {
       await mc.assignOrder(agvId, order, {
         onOrderProcessed: (withError, byCancelation, active) => {
-          this.handleOrderProcessed(m.robotId, m.id, withError, byCancelation, active);
+          this.handleOrderProcessed(m.robotId, m.id, vdaOrderId, withError, byCancelation, active);
         },
       });
     } catch (err) {
@@ -273,6 +361,16 @@ export class Vda5050Adapter implements RobotAdapter {
   async cancelMission(robotId: RobotId): Promise<void> {
     const mc = this.requireStarted();
     const agvId = this.requireAgvId(robotId);
+
+    // C1: clear tracked bookkeeping immediately, synchronously — not only
+    // on the eventual async onOrderProcessed(byCancelation=true)
+    // confirmation — so a same-missionId re-send issued right after this
+    // call (e.g. the orchestrator's offline-timeout/quarantine paths
+    // cancel then requeue, sometimes within the same tick) is correctly
+    // treated as a fresh VDA order rather than an "extension" of an order
+    // that's already being torn down. See the TrackedOrder/class doc
+    // comments for the deadlock this prevents.
+    this.orders.delete(robotId);
 
     await mc.initiateInstantActions(
       agvId,
@@ -321,6 +419,58 @@ export class Vda5050Adapter implements RobotAdapter {
   }
 
   /**
+   * I2: true if `robotId` (an AGV serialNumber) is part of this adapter's
+   * configured fleet. Both the wildcard "state" subscription and
+   * `trackAgvs()` in `start()` hear every AGV sharing this broker +
+   * interfaceName, not just ours — logs the first sighting of an unknown
+   * serial once (not per heartbeat) rather than silently ignoring it
+   * forever, so a misconfiguration is still discoverable.
+   */
+  private isConfiguredRobot(robotId: RobotId): boolean {
+    if (this.agvIdByRobotId.has(robotId)) return true;
+    if (!this.warnedUnknownRobots.has(robotId)) {
+      this.warnedUnknownRobots.add(robotId);
+      // eslint-disable-next-line no-console
+      console.warn(
+        `Vda5050Adapter: ignoring state/connection from unconfigured AGV serialNumber "${robotId}" ` +
+          `— not in configured agvIds. (RobotId = serialNumber only; a multi-manufacturer fleet ` +
+          `reusing this serialNumber under a different manufacturer would otherwise collide.)`
+      );
+    }
+    return false;
+  }
+
+  /**
+   * C1: mints the next per-(robotId, missionId) wire orderId, formatted
+   * `${missionId}#${n}`. `n` is tracked in `attemptCounters` (keyed
+   * `${robotId}::${missionId}`), which is never cleared — see that field's
+   * doc comment for why it must keep incrementing across cancel/terminal
+   * cycles.
+   */
+  private nextAttemptVdaOrderId(robotId: RobotId, missionId: string): string {
+    const key = `${robotId}::${missionId}`;
+    const n = (this.attemptCounters.get(key) ?? -1) + 1;
+    this.attemptCounters.set(key, n);
+    return `${missionId}#${n}`;
+  }
+
+  /**
+   * Reverse-maps a wire-level VDA `orderId` (as echoed back in a `State`
+   * message's `orderId` field) to the RobotAdapter-level `Mission.id` the
+   * orchestrator actually sent — needed because C1 decoupled the two.
+   * Returns `undefined` when there's no currently-live tracked order
+   * matching that exact `vdaOrderId` for this robot (e.g. the mission
+   * already completed/failed/was canceled and its tracked entry was
+   * cleared, matching `FakeAdapter`'s own `currentMissionId = undefined`
+   * behavior once a mission ends).
+   */
+  private resolveMissionId(robotId: RobotId, vdaOrderId: string): string | undefined {
+    if (!vdaOrderId) return undefined;
+    const entry = this.orders.get(robotId);
+    return entry && entry.vdaOrderId === vdaOrderId ? entry.missionId : undefined;
+  }
+
+  /**
    * Validates the FakeAdapter mission-extension semantic (strict-prefix,
    * strictly-longer) and returns the orderUpdateId to use for the resulting
    * VDA order update.
@@ -344,32 +494,38 @@ export class Vda5050Adapter implements RobotAdapter {
   /**
    * Handles a settlement callback from ONE `assignOrder()` call's event
    * handler. Because a stitched (order-update) leg installs a fresh handler
-   * on every call while the VDA orderId stays the same, multiple handlers
-   * may be alive for the same orderId at once; `entry.settled` ensures only
-   * the first genuine terminal event for a given (robotId, missionId) pair
-   * is ever emitted, and the `entry.orderId !== missionId` check discards
-   * callbacks that fire after the robot has since moved on to a completely
-   * different mission id (new leg or reassignment).
+   * on every call while the vdaOrderId stays the same, multiple handlers
+   * may be alive for the same vdaOrderId at once; deleting `orders`'s entry
+   * on the FIRST terminal callback ensures only one terminal AdapterEvent is
+   * ever emitted per attempt, and the `entry.vdaOrderId !== vdaOrderId`
+   * check (C1: keyed on the SPECIFIC attempt, not just missionId) discards
+   * callbacks that fire after the robot has since moved on — to a
+   * completely different mission id, OR to a fresh retry attempt of the
+   * SAME mission id under a new vdaOrderId.
    */
   private handleOrderProcessed(
     robotId: RobotId,
     missionId: string,
+    vdaOrderId: string,
     withError: VdaError | undefined,
     byCancelation: boolean,
     active: boolean
   ): void {
     const entry = this.orders.get(robotId);
-    if (!entry || entry.orderId !== missionId || entry.settled) return;
+    if (!entry || entry.vdaOrderId !== vdaOrderId) return;
 
     if (byCancelation) {
-      // Matches FakeAdapter.cancelMission(): no AdapterEvent is emitted for
-      // an intentional cancel: the orchestrator already deemed this
-      // mission's fate settled by the time it called cancelMission.
-      entry.settled = true;
+      // C1: cancelMission() already cleared bookkeeping synchronously when
+      // it initiated the cancel; this is just the async confirmation
+      // arriving. No AdapterEvent, matching FakeAdapter.cancelMission's
+      // contract (best-effort, silent). Deleting again here is a no-op in
+      // the common case and a safety net if this ever fires without our
+      // own cancelMission having run first.
+      this.orders.delete(robotId);
       return;
     }
     if (withError) {
-      entry.settled = true;
+      this.orders.delete(robotId);
       this.emit({
         type: "missionFailed",
         robotId,
@@ -379,34 +535,46 @@ export class Vda5050Adapter implements RobotAdapter {
       return;
     }
     if (!active) {
-      entry.settled = true;
+      this.orders.delete(robotId);
       this.emit({ type: "missionDone", robotId, missionId });
     }
     // active === true, no error, not canceled: order processed but horizon
     // work remains. We never send horizon nodes (only released base nodes),
     // so this branch should not normally occur; if it does, there is
-    // nothing to report yet.
+    // nothing to report yet — and nothing to clear, so the entry is left
+    // live for the next stitching update.
   }
 
   private handleState(state: VdaState, subject: AgvId): void {
     const robotId: RobotId = subject.serialNumber;
+    if (!this.isConfiguredRobot(robotId)) return; // I2
 
     // missionProgress fires before the accompanying heartbeat "state" event
-    // below, per the RobotAdapter per-tick event-ordering contract.
+    // below, per the RobotAdapter per-tick event-ordering contract. C1:
+    // state.orderId is the wire-level vdaOrderId, not the RobotAdapter
+    // missionId — reverse-mapped via resolveMissionId (undefined when it
+    // doesn't match anything we currently have tracked, e.g. a stale echo
+    // of an already-completed order).
     if (state.lastNodeId && state.lastNodeId !== this.lastNodeIdByRobot.get(robotId)) {
       this.lastNodeIdByRobot.set(robotId, state.lastNodeId);
-      if (state.orderId) {
+      const missionId = this.resolveMissionId(robotId, state.orderId);
+      if (missionId) {
         this.emit({
           type: "missionProgress",
           robotId,
-          missionId: state.orderId,
+          missionId,
           lastNodeId: state.lastNodeId,
         });
       }
     }
 
-    const status: RobotState["status"] =
-      state.errors.length > 0 ? "ERROR" : state.driving ? "EXECUTING" : "IDLE";
+    // C2: only a FATAL-level error whose type isn't a known order/instant-
+    // action lifecycle rejection latches ERROR status — see
+    // ORDER_LIFECYCLE_ERROR_TYPES's doc comment above.
+    const hasFatalHardwareError = state.errors.some(
+      (e) => e.errorLevel === ErrorLevel.Fatal && !ORDER_LIFECYCLE_ERROR_TYPES.has(e.errorType)
+    );
+    const status: RobotState["status"] = hasFatalHardwareError ? "ERROR" : state.driving ? "EXECUTING" : "IDLE";
 
     // Snap the AGV's continuous agvPosition onto the nearest map node's
     // canonical (integer) coordinates rather than passing the raw float
@@ -438,7 +606,7 @@ export class Vda5050Adapter implements RobotAdapter {
         theta: state.agvPosition?.theta ?? 0,
         battery,
         status,
-        currentMissionId: state.orderId ? state.orderId : undefined,
+        currentMissionId: this.resolveMissionId(robotId, state.orderId),
         lastSeen: state.timestamp || new Date().toISOString(),
       },
     });

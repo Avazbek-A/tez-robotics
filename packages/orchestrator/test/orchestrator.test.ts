@@ -509,4 +509,78 @@ describe("Orchestrator", () => {
       expect(adapter.cancelCalls).toEqual(["r1"]);
     });
   });
+
+  describe("I1: premature missionDone (frontier race)", () => {
+    it("rejects a done report that arrives before the robot's known position reaches the leg goal, then recovers via requeue", () => {
+      const map = grid(5);
+      const adapter = new ScriptableAdapter(
+        [
+          { id: "r1", startNodeId: "n0_0" },
+          { id: "r2", startNodeId: "n4_4" },
+        ],
+        map
+      );
+      const clock = fakeClock();
+      const orchestrator = new Orchestrator(map, adapter, { now: clock.now });
+
+      // Pickup close to r1, drop far away so there's a wide window between
+      // "underway" (pick leg done, drop leg started) and r1 actually
+      // reaching the drop node.
+      const order = orchestrator.submitOrder("n1_0", "n4_4");
+
+      let underway = false;
+      for (let i = 0; i < 10 && !underway; i++) {
+        step(orchestrator, adapter);
+        const found = orchestrator.snapshot().orders.find((o) => o.id === order.id);
+        underway = found?.status === "underway";
+      }
+      expect(underway).toBe(true);
+      const midDrop = orchestrator.snapshot().orders.find((o) => o.id === order.id);
+      expect(midDrop?.robotId).toBe("r1");
+
+      const r1Pos = orchestrator.snapshot().robots.find((r) => r.id === "r1")?.pos;
+      // Sanity: r1 is nowhere near the drop node (n4_4) yet.
+      expect(r1Pos).not.toEqual({ x: 4, y: 4 });
+
+      const cancelCallsBefore = adapter.cancelCalls.length;
+
+      // A real (non-lockstepped) adapter can truthfully report the
+      // wire-level mission it most recently sent as fully processed before
+      // this robot's LAST KNOWN position has actually caught up to the
+      // leg's goal node — see Vda5050Adapter's per-tick incremental
+      // extension (only one more base node released per tick). Inject
+      // exactly that: a missionDone for the CURRENT (":drop") leg while r1
+      // is still far from the goal.
+      adapter.injectEvent({
+        type: "missionDone",
+        robotId: "r1",
+        missionId: `${order.id}:drop`,
+      });
+      orchestrator.tickOnce();
+
+      expect(
+        orchestrator
+          .getAlarms()
+          .some((msg) => msg.includes("premature missionDone") && msg.includes("r1"))
+      ).toBe(true);
+      // The premature report triggers a best-effort cancel of whatever the
+      // robot is (mistakenly) still executing.
+      expect(adapter.cancelCalls.length).toBe(cancelCallsBefore + 1);
+
+      const afterPremature = orchestrator.snapshot().orders.find((o) => o.id === order.id);
+      // NOT silently accepted as complete — recoverable via requeue instead.
+      expect(afterPremature?.status).not.toBe("completed");
+      expect(afterPremature?.retries).toBeGreaterThanOrEqual(1);
+
+      // The order recovers and completes normally afterward (whichever
+      // robot ends up finishing it).
+      let completed = false;
+      for (let i = 0; i < 60 && !completed; i++) {
+        step(orchestrator, adapter);
+        const found = orchestrator.snapshot().orders.find((o) => o.id === order.id);
+        completed = found?.status === "completed";
+      }
+      expect(completed).toBe(true);
+    });
+  });
 });

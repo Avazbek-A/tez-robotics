@@ -312,6 +312,37 @@ export class Orchestrator {
     const order = this.verifyReportingRobot(robotId, rt, orderId, "missionDone");
     if (!order) return;
 
+    // I1: frontier-race guard. A real (non-lockstepped) adapter can
+    // truthfully report the wire-level mission it most recently sent as
+    // fully processed before this robot's LAST KNOWN node (rt.currentNodeId,
+    // as of resolveCurrentNodes() this tick) has actually caught up to the
+    // leg's goal node — e.g. Vda5050Adapter only ever releases one more base
+    // node per tick (see its sendMission doc comment), so a fast-moving AGV
+    // can drain its currently-released path and report the VDA order
+    // "done" before the orchestrator has appended/sent the next extension.
+    // Only intercept when the CURRENT leg genuinely matches this missionId
+    // (rt.leg.missionId === missionId) — if it doesn't match at all (no
+    // leg, or a different leg/order entirely), that's the pre-existing
+    // "stale report" case already handled below via book.transition()'s
+    // own try/catch, and must NOT be touched here.
+    if (rt.leg && rt.leg.missionId === missionId && rt.currentNodeId !== rt.leg.goalNode) {
+      this.alarms.push(
+        `t=${this.tickCount} premature missionDone from robot ${robotId} for order ${orderId} ` +
+          `(leg=${leg}, at=${String(rt.currentNodeId)}, goal=${rt.leg.goalNode}) — cancelling and requeueing`
+      );
+      void this.adapter.cancelMission(robotId).catch(() => {
+        /* best-effort; robot may be unreachable */
+      });
+      try {
+        this.book.requeue(orderId, "premature missionDone (frontier race)");
+      } catch {
+        /* already terminal */
+      }
+      this.reservations.releaseAll(robotId);
+      rt.leg = undefined;
+      return;
+    }
+
     if (leg === "pick") {
       try {
         this.book.transition(orderId, "underway", "pickup complete");
