@@ -35,6 +35,10 @@ importers:
       '@tez/shared':
         specifier: workspace:*
         version: link:../shared
+    devDependencies:
+      vda-5050-lib:
+        specifier: ^1.7
+        version: 1.7.2
 
   packages/robot-interface:
     dependencies:

@@ -11,5 +11,8 @@
     "@tez/core": "workspace:*",
     "@tez/robot-interface": "workspace:*",
     "@tez/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "vda-5050-lib": "^1.7"
   }
 }
