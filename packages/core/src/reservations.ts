@@ -3,46 +3,84 @@ import type { CellKey, RobotId } from "@tez/shared";
 /**
  * ReservationTable: openTCS-style cell ownership tracking.
  * - Each cell has at most one owner (robot)
- * - claim() is atomic prefix-grant: stops at first foreign-owned cell
+ * - claim() declares the robot's complete desired hold-set in path order.
+ *   Returns the longest grantable prefix (stops at first foreign-owned cell).
+ *   All previously owned cells NOT in the granted prefix are released.
+ *   Path revisits are deduped: a cell is held once regardless of order revisits.
  * - release() frees only cells strictly behind the current position
  * - Robot motion layer may only enter cells it has claimed
+ *
+ * Invariant: for every robot, a cell is in robotCells iff it is in cellOwner
+ *            with the robot as owner (bidirectional consistency).
  */
 export class ReservationTable {
   private cellOwner: Map<CellKey, RobotId> = new Map();
   private robotCells: Map<RobotId, CellKey[]> = new Map();
 
   /**
-   * Claim next cells for robot; returns granted prefix (may be shorter than asked).
-   * Stops at the first foreign-owned cell. Idempotent for cells already owned by the robot.
+   * Claim cells for robot; returns granted prefix (may be shorter than asked).
+   * Semantics: cells is the robot's desired hold-set in order. Grant = longest prefix
+   * where each cell is unowned OR already owned by this robot. Stops at first foreign cell.
+   *
+   * After claim, robot owns exactly the granted cells, no more/less (w.r.t. previous state).
+   * All previously owned cells NOT in granted are released.
+   *
+   * Path revisits are deduped (keeping first occurrence) before grant computation.
+   * Empty claim releases all robot's cells.
    */
   claim(robot: RobotId, cells: CellKey[]): CellKey[] {
-    if (cells.length === 0) {
+    // Step 1: Dedupe cells, keeping first occurrence of each unique CellKey
+    const seen = new Set<CellKey>();
+    const deduped: CellKey[] = [];
+    for (const cell of cells) {
+      if (!seen.has(cell)) {
+        deduped.push(cell);
+        seen.add(cell);
+      }
+    }
+
+    // Step 2: Handle empty claim (release all robot's cells)
+    if (deduped.length === 0) {
+      const prevCells = this.robotCells.get(robot);
+      if (prevCells) {
+        for (const cell of prevCells) {
+          this.cellOwner.delete(cell);
+        }
+        this.robotCells.delete(robot);
+      }
       return [];
     }
 
+    // Step 3: Compute granted prefix (unowned or already owned by this robot)
     const granted: CellKey[] = [];
-
-    for (const cell of cells) {
+    for (const cell of deduped) {
       const owner = this.cellOwner.get(cell);
-
-      // If this cell is unowned or owned by this robot, we can claim it
       if (owner === undefined || owner === robot) {
         granted.push(cell);
-        // Set ownership if not already owned by this robot
-        if (!this.cellOwner.has(cell)) {
-          this.cellOwner.set(cell, robot);
-        }
       } else {
         // Foreign-owned cell: stop the grant here
         break;
       }
     }
 
-    // Update or create the robot's cell list with the new granted cells
-    // For idempotency: if re-claiming, we replace the list with the new granted sequence
-    if (granted.length > 0) {
-      this.robotCells.set(robot, granted);
+    // Step 4: Free all previously owned cells NOT in granted
+    const prevCells = this.robotCells.get(robot) || [];
+    const grantedSet = new Set(granted);
+    for (const cell of prevCells) {
+      if (!grantedSet.has(cell)) {
+        this.cellOwner.delete(cell);
+      }
     }
+
+    // Step 5: Claim new cells in granted that aren't already owned by this robot
+    for (const cell of granted) {
+      if (!this.cellOwner.has(cell)) {
+        this.cellOwner.set(cell, robot);
+      }
+    }
+
+    // Step 6: Store granted as the robot's new list
+    this.robotCells.set(robot, granted);
 
     return granted;
   }
@@ -92,5 +130,16 @@ export class ReservationTable {
       }
       this.robotCells.delete(robot);
     }
+  }
+
+  /**
+   * Internal snapshot for testing consistency.
+   * Exposed for assertConsistent helper in tests.
+   */
+  _snapshot(): { cells: Map<CellKey, RobotId>; byRobot: Map<RobotId, CellKey[]> } {
+    return {
+      cells: new Map(this.cellOwner),
+      byRobot: new Map(this.robotCells.entries().map(([k, v]) => [k, [...v]]))
+    };
   }
 }
