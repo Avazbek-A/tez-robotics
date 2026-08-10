@@ -260,10 +260,24 @@ export class Orchestrator {
    * order.robotId and leaving the real assignee's leg permanently stuck.
    *
    * Returns the live order object when `robotId` is confirmed to be its
-   * current holder and its id matches `orderId`; otherwise logs an alarm,
-   * best-effort cancels whatever the reporting robot thinks it's still
-   * doing, clears its (already-stale) local leg bookkeeping so it falls
-   * back into the dispatch pool, and returns undefined.
+   * current holder and its id matches `orderId`; otherwise logs an alarm
+   * and returns undefined.
+   *
+   * Round-2 fix: on mismatch, do NOT unconditionally cancel the reporting
+   * robot's adapter mission or clear its `rt.leg`. A robot can legitimately
+   * be reassigned to a brand-new order B after the order this stale report
+   * names (A) was requeued away from it; at that point `rt.leg` correctly
+   * points at B, and B's mission is live and unrelated. Blindly canceling
+   * here would kill B's real mission and blindly clearing `rt.leg` would
+   * strand the robot (it stops getting mission extensions from
+   * `runRouting()`, yet `book.byRobot()` still shows it holding B, so
+   * `runDispatch()`'s `!rt.leg` gate never re-admits it to the idle pool
+   * either — permanently stuck). Only touch the robot's bookkeeping/adapter
+   * state when its CURRENT leg is for the SAME order the stale report
+   * names — i.e. our own tracking agrees this report might plausibly be
+   * about what's live right now, so cleaning it up is safe. If `rt.leg` is
+   * undefined or for a different order, there is nothing of this stale
+   * report's to clean up: leave it alone.
    */
   private verifyReportingRobot(
     robotId: RobotId,
@@ -279,10 +293,12 @@ export class Orchestrator {
       `t=${this.tickCount} stale ${kind} from robot ${robotId} for order ${orderId} — ` +
         `not its current order, ignoring (order not advanced)`
     );
-    void this.adapter.cancelMission(robotId).catch(() => {
-      /* best-effort; robot may be unreachable, which is exactly why this fired */
-    });
-    rt.leg = undefined;
+    if (rt.leg?.orderId === orderId) {
+      void this.adapter.cancelMission(robotId).catch(() => {
+        /* best-effort; robot may be unreachable, which is exactly why this fired */
+      });
+      rt.leg = undefined;
+    }
     return undefined;
   }
 

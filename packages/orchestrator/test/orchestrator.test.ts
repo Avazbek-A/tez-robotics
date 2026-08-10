@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { WarehouseMap } from "@tez/core";
 import { FakeAdapter } from "@tez/robot-interface";
+import type { AdapterEvent } from "@tez/robot-interface";
 import type { RobotId, RobotState } from "@tez/shared";
 import { Orchestrator } from "../src/orchestrator.js";
 
@@ -17,6 +18,44 @@ import { Orchestrator } from "../src/orchestrator.js";
 class UncancellableFakeAdapter extends FakeAdapter {
   override async cancelMission(_robotId: RobotId): Promise<void> {
     throw new Error("robot unreachable");
+  }
+}
+
+/**
+ * FakeAdapter subclass that (a) records every cancelMission() call and (b)
+ * exposes the handler the orchestrator registered via on(), so a test can
+ * directly inject an arbitrary AdapterEvent — bypassing FakeAdapter's own
+ * tick()-driven mission simulation entirely.
+ *
+ * This is needed for the round-2 regression test: a stale missionDone for
+ * an OLD order (A) arriving strictly AFTER the robot has already been
+ * legitimately reassigned to a NEW order (B) cannot be reproduced by
+ * simply letting the old FakeAdapter mission run its course, because
+ * sendMission()'s "new mission" branch (different mission id) overwrites
+ * FakeAdapter's internal mission object as soon as B is dispatched —
+ * silently discarding whatever was left of the stale A mission before it
+ * could ever fire its own missionDone. Real robots don't have that
+ * property (a command in flight and a stale ack can race independently
+ * over the network), so this test fabricates the race directly by
+ * injecting the stale event at the exact moment desired.
+ */
+class ScriptableAdapter extends FakeAdapter {
+  cancelCalls: RobotId[] = [];
+  private capturedHandler?: (e: AdapterEvent) => void;
+
+  override on(handler: (e: AdapterEvent) => void): void {
+    this.capturedHandler = handler;
+    super.on(handler);
+  }
+
+  override async cancelMission(robotId: RobotId): Promise<void> {
+    this.cancelCalls.push(robotId);
+    return super.cancelMission(robotId);
+  }
+
+  injectEvent(e: AdapterEvent): void {
+    if (!this.capturedHandler) throw new Error("no handler registered yet");
+    this.capturedHandler(e);
   }
 }
 
@@ -375,6 +414,99 @@ describe("Orchestrator", () => {
       // Once for r1's original pickup, once for r2's fresh pickup after
       // the requeue-from-underway restart.
       expect(pickTransitions).toHaveLength(2);
+    });
+  });
+
+  describe("round 2: stale report for a robot reassigned to a DIFFERENT order", () => {
+    it("does not cancel or clear the robot's live, unrelated mission", () => {
+      const map = grid(5);
+      const adapter = new ScriptableAdapter(
+        [
+          { id: "r1", startNodeId: "n0_0" },
+          { id: "r2", startNodeId: "n4_4" },
+        ],
+        map
+      );
+      const clock = fakeClock();
+      const orchestrator = new Orchestrator(map, adapter, {
+        now: clock.now,
+        offlineGraceMs: 5_000,
+      });
+
+      // r1 gets order A's :pick leg.
+      const orderA = orchestrator.submitOrder("n2_0", "n4_4");
+      step(orchestrator, adapter);
+      step(orchestrator, adapter);
+      let a = orchestrator.snapshot().orders.find((o) => o.id === orderA.id);
+      expect(a?.robotId).toBe("r1");
+
+      // A is requeued away from r1 (offline + grace period) and r2 picks
+      // it up instead.
+      adapter.setConnection("r1", false);
+      orchestrator.tickOnce();
+      clock.advance(6_000);
+      orchestrator.tickOnce();
+      const cancelCallsAfterOfflineTimeout = adapter.cancelCalls.length;
+      expect(cancelCallsAfterOfflineTimeout).toBe(1); // the legitimate offline-timeout cancel
+
+      let aTakenByR2 = false;
+      for (let i = 0; i < 10 && !aTakenByR2; i++) {
+        step(orchestrator, adapter);
+        const found = orchestrator.snapshot().orders.find((o) => o.id === orderA.id);
+        aTakenByR2 = found?.robotId === "r2";
+      }
+      expect(aTakenByR2).toBe(true);
+
+      // r1 comes back online and is legitimately dispatched a brand-new
+      // order B.
+      adapter.setConnection("r1", true);
+      orchestrator.tickOnce();
+
+      const orderB = orchestrator.submitOrder("n0_0", "n0_1");
+      let bDispatchedToR1 = false;
+      for (let i = 0; i < 10 && !bDispatchedToR1; i++) {
+        step(orchestrator, adapter);
+        const found = orchestrator.snapshot().orders.find((o) => o.id === orderB.id);
+        bDispatchedToR1 = found?.status === "dispatched" && found?.robotId === "r1";
+      }
+      expect(bDispatchedToR1).toBe(true);
+      const cancelCallsAtBDispatch = adapter.cancelCalls.length;
+      expect(cancelCallsAtBDispatch).toBe(cancelCallsAfterOfflineTimeout); // no cancel from dispatching B
+
+      // Now the stale ack for A's old :pick mission finally arrives from
+      // r1 — strictly after r1 was reassigned to B.
+      adapter.injectEvent({
+        type: "missionDone",
+        robotId: "r1",
+        missionId: `${orderA.id}:pick`,
+      });
+      orchestrator.tickOnce();
+
+      expect(
+        orchestrator.getAlarms().some((msg) => msg.includes("stale missionDone") && msg.includes("r1"))
+      ).toBe(true);
+
+      // The critical assertion: B's live mission must NOT have been
+      // canceled, and B must still be bound to r1.
+      expect(adapter.cancelCalls.length).toBe(cancelCallsAtBDispatch);
+      const bAfterStaleReport = orchestrator.snapshot().orders.find((o) => o.id === orderB.id);
+      expect(bAfterStaleReport?.robotId).toBe("r1");
+      expect(["dispatched", "underway"]).toContain(bAfterStaleReport?.status);
+
+      // B must complete normally on r1.
+      let bCompleted = false;
+      for (let i = 0; i < 40 && !bCompleted; i++) {
+        step(orchestrator, adapter);
+        const found = orchestrator.snapshot().orders.find((o) => o.id === orderB.id);
+        bCompleted = found?.status === "completed";
+      }
+      expect(bCompleted).toBe(true);
+      const finalB = orchestrator.snapshot().orders.find((o) => o.id === orderB.id);
+      expect(finalB?.robotId).toBe("r1");
+
+      // No cancelMission calls happened beyond the one legitimate
+      // offline-timeout cancel for A, across the entire scenario.
+      expect(adapter.cancelCalls).toEqual(["r1"]);
     });
   });
 });
