@@ -266,4 +266,53 @@ describe("dispatch", () => {
     expect(new Set(robotIds).size).toBe(3);
     expect(new Set(orderIds).size).toBe(3);
   });
+
+  it("should achieve optimal assignment on square 2x2 fully symmetric matrix (idle bonus cancels)", () => {
+    // Square matrix (2 robots, 2 orders) with fully symmetric distances.
+    // On square matrices, idleBonus cancels: Σ(distance - idleBonus) across all valid
+    // matchings is equivalent to Σ(distance), so idle fairness is a no-op and
+    // optimal assignment depends purely on distances. This is acceptable since
+    // all robots get assigned anyway (no arbitration needed).
+    const mapData = {
+      nodes: [
+        { id: "r1", pos: { x: 0, y: 0 } },
+        { id: "r2", pos: { x: 2, y: 0 } },
+        { id: "o1", pos: { x: 0, y: 1 } },
+        { id: "o2", pos: { x: 2, y: 1 } },
+      ],
+      edges: [
+        { from: "r1", to: "o1", bidirectional: true },
+        { from: "r1", to: "o2", bidirectional: true },
+        { from: "r2", to: "o1", bidirectional: true },
+        { from: "r2", to: "o2", bidirectional: true },
+      ],
+    };
+    const map = WarehouseMap.fromJSON(mapData);
+
+    // Both robots at distance 1 from both orders (symmetric).
+    // Any matching has total distance 2; idleBonus is constant, so selection is stable.
+    const robots = [
+      { id: asRobotId("r1"), at: "r1", idleSince: 5 },
+      { id: asRobotId("r2"), at: "r2", idleSince: 10 },
+    ];
+    const orders = [
+      { id: "o1", pickupNode: "o1" },
+      { id: "o2", pickupNode: "o2" },
+    ];
+
+    const result = dispatch(robots, orders, map);
+
+    // Both robots must be assigned (perfect matching on square matrix)
+    expect(result).toHaveLength(2);
+    const assignedRobots = new Set(result.map((a) => a.robotId));
+    expect(assignedRobots.size).toBe(2);
+
+    // Total distance must be optimal (2 hops, since all distances are 1)
+    const totalDistance = result.reduce((sum, assignment) => {
+      const robot = robots.find((r) => r.id === assignment.robotId)!;
+      const order = orders.find((o) => o.id === assignment.orderId)!;
+      return sum + map.distance(robot.at, order.pickupNode);
+    }, 0);
+    expect(totalDistance).toBe(2); // 1 + 1 for optimal pairing
+  });
 });

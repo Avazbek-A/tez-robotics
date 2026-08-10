@@ -35,6 +35,14 @@ function idleBonus(idleSince: number): number {
  *
  * Cost = distance(robot, order) - idleBonus(robot)
  * where idleBonus favors longer-idle robots as tie-breaker.
+ *
+ * Note on idleBonus behavior:
+ * - On rectangular matrices (robots > orders): idleBonus meaningfully affects assignment,
+ *   allowing fair load balancing—robots with longer idle times are preferred for available orders.
+ * - On square matrices (robots ≡ orders): idleBonus mathematically cancels across all valid
+ *   matchings (Σ idleBonus is constant), so assignment is determined purely by distance.
+ *   This is acceptable—all robots are assigned anyway, so idle fairness has no arbitration role.
+ *
  * Unreachable pairs cost 1e9 and are filtered from the result.
  */
 export function dispatch(

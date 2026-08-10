@@ -1,7 +1,6 @@
 /**
- * Hungarian algorithm (Kuhn–Munkres). Clean TypeScript implementation.
+ * Hungarian algorithm (Kuhn–Munkres). Original clean-room TypeScript implementation for this project.
  * Solves the assignment problem for rectangular matrices in O(n³) time.
- * MIT License
  */
 
 /**
