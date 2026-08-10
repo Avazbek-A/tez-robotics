@@ -4,7 +4,20 @@
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
+  "bin": {
+    "tez-sim": "dist/cli.js"
+  },
   "scripts": {
-    "test": "vitest run --passWithNoTests"
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@tez/core": "workspace:*",
+    "vda-5050-lib": "^1.7"
+  },
+  "devDependencies": {
+    "@tez/orchestrator": "workspace:*",
+    "@tez/robot-interface": "workspace:*",
+    "@tez/shared": "workspace:*"
   }
 }
