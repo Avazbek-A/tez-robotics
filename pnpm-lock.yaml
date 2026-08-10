@@ -24,6 +24,18 @@ importers:
         specifier: workspace:*
         version: link:../shared
 
+  packages/orchestrator:
+    dependencies:
+      '@tez/core':
+        specifier: workspace:*
+        version: link:../core
+      '@tez/robot-interface':
+        specifier: workspace:*
+        version: link:../robot-interface
+      '@tez/shared':
+        specifier: workspace:*
+        version: link:../shared
+
   packages/robot-interface:
     dependencies:
       '@tez/core':

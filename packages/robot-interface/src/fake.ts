@@ -5,6 +5,7 @@ import type { Mission, AdapterEvent, RobotAdapter } from "./adapter.js";
 interface FakeRobotState {
   state: RobotState;
   currentNodeIndex: number;
+  online: boolean;
   mission?: {
     id: string;
     nodeIds: string[];
@@ -34,6 +35,7 @@ export class FakeAdapter implements RobotAdapter {
           lastSeen: new Date().toISOString(),
         },
         currentNodeIndex: 0,
+        online: true,
       });
     }
   }
@@ -112,8 +114,50 @@ export class FakeAdapter implements RobotAdapter {
     this.handlers.push(handler);
   }
 
+  /**
+   * Test-support hook (not part of RobotAdapter): simulate a connection-loss
+   * or reconnection event, e.g. an MQTT last-will firing. Emits a
+   * `connection` event. While offline, tick() skips this robot entirely
+   * (no state/progress/done emission and no mission advancement) — mirroring
+   * a real dropped link where no telemetry arrives at all.
+   */
+  setConnection(robotId: RobotId, online: boolean): void {
+    const robot = this.robotStates.get(robotId);
+    if (!robot) {
+      throw new Error(`Robot ${robotId} not found`);
+    }
+    robot.online = online;
+    this.emit({ type: "connection", robotId, online });
+  }
+
+  /**
+   * Test-support hook (not part of RobotAdapter): simulate a mission-level
+   * failure (e.g. rejected action, robot fault) without going through the
+   * normal tick()-driven completion path. Emits `missionFailed` and returns
+   * the robot to IDLE with no active mission.
+   */
+  failMission(robotId: RobotId, reason = "simulated failure"): void {
+    const robot = this.robotStates.get(robotId);
+    if (!robot) {
+      throw new Error(`Robot ${robotId} not found`);
+    }
+    if (!robot.mission) {
+      throw new Error(`Robot ${robotId} has no active mission to fail`);
+    }
+    const missionId = robot.mission.id;
+    robot.mission = undefined;
+    robot.state.status = "IDLE";
+    robot.state.currentMissionId = undefined;
+    robot.state.lastSeen = new Date().toISOString();
+    this.emit({ type: "missionFailed", robotId, missionId, reason });
+  }
+
   tick(): void {
     for (const [robotId, robot] of this.robotStates.entries()) {
+      if (!robot.online) {
+        // Connection is down: no telemetry, no mission progress.
+        continue;
+      }
       if (robot.mission) {
         // Advance to next node
         robot.currentNodeIndex++;
