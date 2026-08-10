@@ -26,6 +26,12 @@ importers:
 
   packages/robot-interface:
     dependencies:
+      '@tez/core':
+        specifier: workspace:*
+        version: link:../core
+      '@tez/shared':
+        specifier: workspace:*
+        version: link:../shared
       mqtt:
         specifier: ^5
         version: 5.15.2

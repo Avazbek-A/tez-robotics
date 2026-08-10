@@ -8,6 +8,8 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
+    "@tez/core": "workspace:*",
+    "@tez/shared": "workspace:*",
     "mqtt": "^5",
     "vda-5050-lib": "^1.7"
   },
