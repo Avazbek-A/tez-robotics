@@ -3,10 +3,12 @@
 // Algorithm: Okumura, Machida, Défago & Tamura, "Priority Inheritance with
 // Backtracking for Iterative Multi-agent Path Finding", IJCAI 2019 / AIJ 2022.
 // The processing structure here (priority-descending outer loop, recursive
-// priority-inheritance search over distance-greedy candidates, in-progress
-// cycle guard) is a TypeScript port of the approach used by Kei18/pypibt
-// (MIT License, https://github.com/Kei18/pypibt) — reimplemented from the
-// published algorithm description, not copied from the Python source.
+// priority-inheritance search over distance-greedy candidates, tentative
+// next-cell reservation before recursing so closed push-cycles/rotations
+// resolve in one step) is a TypeScript port of the approach used by
+// Kei18/pypibt (MIT License, https://github.com/Kei18/pypibt) —
+// reimplemented from the published algorithm description, not copied from
+// the Python source.
 
 import type { RobotId } from "@tez/shared";
 import type { WarehouseMap } from "./map.js";
@@ -15,14 +17,28 @@ export interface Agent {
   id: RobotId;
   at: string;
   goal: string;
+  /**
+   * Seed/base priority hint. Used as the agent's base priority the first
+   * time its id is seen by a router instance (higher wins ties on a
+   * contested cell). If omitted/non-finite, or if it ties with another
+   * agent's base, ties fall back to insertion order and then to a
+   * lexicographic id comparison, keeping a strict deterministic order.
+   * After the first sighting, priority is managed internally by the
+   * router (incremented each step the agent is off-goal, reset to its
+   * base on reaching goal) — this field is not re-read on later steps.
+   */
   priority: number;
 }
 
 interface PriorityState {
-  /** Assigned once, in first-seen order. Used as a deterministic tie-break
-   *  and as the value priority resets to whenever the agent is at its goal. */
+  /** Seeded from Agent.priority on first sight (or insertion order if
+   *  absent/non-finite). The value priority resets to whenever the agent
+   *  is at its goal. */
   base: number;
   current: number;
+  /** First-seen sequence number; deterministic tie-break when base/current
+   *  are equal (e.g. every caller passes the same default priority). */
+  insertionOrder: number;
 }
 
 export class PibtRouter {
@@ -53,18 +69,24 @@ export class PibtRouter {
     for (const agent of agents) occupied.set(agent.at, agent.id);
 
     const nextClaimed = new Map<string, RobotId>(); // nodeId -> agent claiming it next
-    const nextOf = new Map<RobotId, string>(); // agentId -> its next node
+    const nextOf = new Map<RobotId, string>(); // agentId -> its (possibly tentative) next node
     const assigned = new Set<RobotId>(); // agent has a final decided move
     const inProgress = new Set<RobotId>(); // agent is being decided further up the call stack
 
     const pibt = (agentId: RobotId): boolean => {
       if (assigned.has(agentId)) return true;
-      // Cycle guard: an agent already being decided higher up this call
-      // stack cannot be pushed again — treat it as immovable for now. This
-      // guarantees termination (recursion depth is bounded by agent count)
-      // at the cost of occasionally not resolving a full rotation in a
-      // single step; priority inheritance resolves it over later steps.
-      if (inProgress.has(agentId)) return false;
+      if (inProgress.has(agentId)) {
+        // We looped back onto an ancestor still being decided further up
+        // this call stack — i.e. the push chain closes a cycle/rotation.
+        // That ancestor already reserved a tentative next cell for itself
+        // (we always set nextOf before recursing further, below), and the
+        // caller already verified that reservation isn't a 2-agent edge
+        // swap with us before invoking this call. So the ancestor is
+        // vacating its current cell; let the rotation close successfully
+        // instead of failing, which is what lets an n-agent rotation
+        // resolve in a single step.
+        return true;
+      }
       inProgress.add(agentId);
 
       const agent = byId.get(agentId);
@@ -86,24 +108,36 @@ export class PibtRouter {
 
         const occupant = occupied.get(candidate);
         if (occupant !== undefined && occupant !== agentId) {
+          // occupant's tentative/final next cell, if it has committed to one
+          // yet (set eagerly below, before recursing, so this also catches
+          // occupants that are mid-recursion ancestors).
           const occupantNext = nextOf.get(occupant);
           if (occupantNext === agent.at) continue; // would be an edge swap
         }
 
+        // Reserve the candidate tentatively BEFORE recursing into its
+        // occupant. This is what lets a push chain that loops back onto an
+        // ancestor see that ancestor already committed to vacate, instead
+        // of only discovering that after the whole chain unwinds.
         nextClaimed.set(candidate, agentId);
+        nextOf.set(agentId, candidate);
 
+        let ok = true;
         if (occupant !== undefined && occupant !== agentId && !assigned.has(occupant)) {
-          const pushed = pibt(occupant);
-          if (!pushed) {
-            nextClaimed.delete(candidate);
-            continue;
-          }
+          ok = pibt(occupant);
         }
 
-        nextOf.set(agentId, candidate);
-        assigned.add(agentId);
-        inProgress.delete(agentId);
-        return true;
+        if (ok) {
+          assigned.add(agentId);
+          inProgress.delete(agentId);
+          return true;
+        }
+
+        // Backtrack: undo the tentative reservation and try the next
+        // candidate. This keeps the invariant that a failed pibt() call
+        // leaves nextClaimed/nextOf exactly as it found them.
+        nextClaimed.delete(candidate);
+        nextOf.delete(agentId);
       }
 
       inProgress.delete(agentId);
@@ -121,8 +155,9 @@ export class PibtRouter {
     for (const agent of agents) {
       let state = this.priorities.get(agent.id);
       if (!state) {
-        const base = this.priorities.size;
-        state = { base, current: base };
+        const insertionOrder = this.priorities.size;
+        const base = Number.isFinite(agent.priority) ? agent.priority : insertionOrder;
+        state = { base, current: base, insertionOrder };
         this.priorities.set(agent.id, state);
       }
       if (agent.at === agent.goal) {
@@ -137,6 +172,7 @@ export class PibtRouter {
     const pa = this.priorities.get(a)!;
     const pb = this.priorities.get(b)!;
     if (pa.current !== pb.current) return pb.current - pa.current;
-    return pa.base - pb.base;
+    if (pa.insertionOrder !== pb.insertionOrder) return pa.insertionOrder - pb.insertionOrder;
+    return a < b ? -1 : a > b ? 1 : 0;
   }
 }

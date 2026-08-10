@@ -143,6 +143,146 @@ describe("PibtRouter", () => {
     expect(step).toBeLessThan(maxSteps);
   });
 
+  it("resolves a 4-agent rotation on a 2x2 grid in one step (no permanent deadlock)", () => {
+    // n0_0-n1_0-n1_1-n0_1-n0_0 is a 4-cycle. Every agent's goal is the next
+    // node clockwise around the cycle, so all four cells are simultaneously
+    // occupied and every agent's best move is "push the agent ahead of me."
+    // This is the saturated-cycle case that a naive in-progress-cycle guard
+    // deadlocks on forever: with tentative next-cell reservation set before
+    // recursing, the push chain sees the ancestor already committed to
+    // vacate and the whole rotation resolves in a single step.
+    const map = WarehouseMap.fromJSON(WarehouseMap.grid(2, 2));
+    const router = new PibtRouter(map);
+
+    let agents: Agent[] = [
+      { id: "A", at: "n0_0", goal: "n1_0", priority: 0 },
+      { id: "B", at: "n1_0", goal: "n1_1", priority: 0 },
+      { id: "C", at: "n1_1", goal: "n0_1", priority: 0 },
+      { id: "D", at: "n0_1", goal: "n0_0", priority: 0 },
+    ];
+
+    const maxSteps = 5;
+    let steps = 0;
+    for (; steps < maxSteps; steps++) {
+      if (agents.every((a) => a.at === a.goal)) break;
+
+      const prev = new Map(agents.map((a) => [a.id, a.at]));
+      const next = router.step(agents);
+
+      expect(next.size).toBe(agents.length);
+      assertNoConflicts(prev, next);
+
+      agents = agents.map((a) => ({ ...a, at: next.get(a.id)! }));
+    }
+
+    expect(steps).toBe(1); // the whole rotation should close on the very first step
+    expect(agents.every((a) => a.at === a.goal)).toBe(true);
+  });
+
+  it("resolves a 6-agent ring rotation on a 3x2 grid in one step (no permanent deadlock)", () => {
+    // Boundary cycle of the 3x2 grid: n0_0-n1_0-n2_0-n2_1-n1_1-n0_1-n0_0.
+    // (grid(3,2) also has a middle vertical chord n1_0-n1_1, which doesn't
+    // interfere since it's never any agent's shortest move here.) Every
+    // agent's goal is the next node clockwise, saturating the ring the same
+    // way as the 4-agent case above, at a size where a naive cycle guard
+    // would freeze permanently too.
+    const map = WarehouseMap.fromJSON(WarehouseMap.grid(3, 2));
+    const router = new PibtRouter(map);
+
+    let agents: Agent[] = [
+      { id: "A", at: "n0_0", goal: "n1_0", priority: 0 },
+      { id: "B", at: "n1_0", goal: "n2_0", priority: 0 },
+      { id: "C", at: "n2_0", goal: "n2_1", priority: 0 },
+      { id: "D", at: "n2_1", goal: "n1_1", priority: 0 },
+      { id: "E", at: "n1_1", goal: "n0_1", priority: 0 },
+      { id: "F", at: "n0_1", goal: "n0_0", priority: 0 },
+    ];
+
+    const maxSteps = 5;
+    let steps = 0;
+    for (; steps < maxSteps; steps++) {
+      if (agents.every((a) => a.at === a.goal)) break;
+
+      const prev = new Map(agents.map((a) => [a.id, a.at]));
+      const next = router.step(agents);
+
+      expect(next.size).toBe(agents.length);
+      assertNoConflicts(prev, next);
+
+      agents = agents.map((a) => ({ ...a, at: next.get(a.id)! }));
+    }
+
+    expect(steps).toBe(1);
+    expect(agents.every((a) => a.at === a.goal)).toBe(true);
+  });
+
+  it("lets a higher seeded base priority win a contested cell", () => {
+    // A and B both want the empty center cell as their best first move.
+    // A is inserted first in the array (which, under a pure
+    // insertion-order priority scheme, would make it LOWER priority and
+    // thus the loser) but is given a much higher `priority` seed value, so
+    // if that field is actually wired up, A must win despite going first
+    // in the array.
+    const map = WarehouseMap.fromJSON(WarehouseMap.grid(3, 3));
+    const router = new PibtRouter(map);
+
+    const agents: Agent[] = [
+      { id: "A", at: "n0_1", goal: "n2_1", priority: 100 },
+      { id: "B", at: "n1_0", goal: "n1_2", priority: 1 },
+    ];
+
+    const next = router.step(agents);
+
+    expect(next.get("A")).toBe("n1_1"); // A wins the contested center cell
+    expect(next.get("B")).toBe("n1_0"); // B falls back to staying
+  });
+
+  it("keeps throughput under lifelong goal churn (20 agents, 300 steps, reassigned goals)", () => {
+    // Whenever an agent reaches its goal it's immediately handed a new
+    // random goal (deterministic via a seeded PRNG), which is the
+    // "lifelong MAPF" usage pattern this router's priority reset/increment
+    // scheme is designed for. This exercises many goal-reset events across
+    // a long run, not just a single one-shot delivery.
+    const width = 10;
+    const height = 6;
+    const map = WarehouseMap.fromJSON(WarehouseMap.grid(width, height));
+    const router = new PibtRouter(map);
+
+    const rng = mulberry32(42);
+    const nodeIds = map.nodeIds;
+    const randomNode = (): string => nodeIds[Math.floor(rng() * nodeIds.length)]!;
+
+    const agentCount = 20;
+    const shuffled = shuffle(nodeIds, rng);
+    let agents: Agent[] = shuffled.slice(0, agentCount).map((at, i) => ({
+      id: `r${i}`,
+      at,
+      goal: randomNode(),
+      priority: 0,
+    }));
+
+    let goalsReached = 0;
+    const steps = 300;
+    for (let t = 0; t < steps; t++) {
+      const prev = new Map(agents.map((a) => [a.id, a.at]));
+      const next = router.step(agents);
+
+      expect(next.size).toBe(agents.length);
+      assertNoConflicts(prev, next);
+
+      agents = agents.map((a) => {
+        const at = next.get(a.id)!;
+        if (at === a.goal) {
+          goalsReached++;
+          return { ...a, at, goal: randomNode() };
+        }
+        return { ...a, at };
+      });
+    }
+
+    expect(goalsReached).toBeGreaterThan(100);
+  });
+
   it("handles 50 agents on a 20x10 grid within a sane per-step time budget", () => {
     const map = WarehouseMap.fromJSON(WarehouseMap.grid(20, 10));
     const router = new PibtRouter(map);
