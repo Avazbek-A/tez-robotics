@@ -39,6 +39,12 @@ export class IllegalTransition extends Error {
  * - dispatched|underway → queued (requeue, increments retries)
  * - requeue with retries ≥ 3 → failed instead
  *
+ * RobotId lifecycle:
+ * - robotId is set ONLY via assign(orderId, robotId) which atomically transitions queued→dispatched
+ * - requeue() clears robotId (order returns to dispatch pool unbound)
+ * - Terminal states (completed, failed, canceled) RETAIN robotId for audit trail
+ * - byRobot() returns only ACTIVE orders (dispatched|underway); terminal orders never returned
+ *
  * Injects a clock function for deterministic testing.
  */
 export class OrderBook {
@@ -74,15 +80,14 @@ export class OrderBook {
 
   /**
    * Transition an order to a new status.
-   * Optionally set robotId when transitioning to dispatched.
+   * robotId is never set by transition() — use assign() instead.
    *
    * @throws IllegalTransition if the transition is not allowed
    */
   transition(
     id: string,
     to: OrderStatus,
-    reason?: string,
-    robotId?: RobotId
+    reason?: string
   ): TransportOrder {
     const order = this.orders.get(id);
     if (!order) {
@@ -101,20 +106,44 @@ export class OrderBook {
     // Perform the transition
     order.status = to;
 
-    // Set or clear robotId based on status
-    if (to === "dispatched" && robotId) {
-      order.robotId = robotId;
-    } else if (to === "queued") {
-      // Clear robotId when requeuing
-      order.robotId = undefined;
-    }
-
     // Record history
     order.history.push({
       at: this.clock(),
       from,
       to,
       reason,
+    });
+
+    return order;
+  }
+
+  /**
+   * Assign an order to a robot: queued → dispatched with robotId set atomically.
+   * This is the ONLY way to set robotId.
+   *
+   * @throws IllegalTransition if order is not in queued status
+   */
+  assign(orderId: string, robotId: RobotId): TransportOrder {
+    const order = this.orders.get(orderId);
+    if (!order) {
+      throw new IllegalTransition(`Order not found: ${orderId}`);
+    }
+
+    if (order.status !== "queued") {
+      throw new IllegalTransition(
+        `Cannot assign non-queued order: status ${order.status}`
+      );
+    }
+
+    order.status = "dispatched";
+    order.robotId = robotId;
+
+    // Record history
+    order.history.push({
+      at: this.clock(),
+      from: "queued",
+      to: "dispatched",
+      reason: `Assigned to ${robotId}`,
     });
 
     return order;
@@ -146,7 +175,7 @@ export class OrderBook {
     // If retries >= 3, fail the order instead of requeuing
     if (order.retries >= 3) {
       order.status = "failed";
-      order.robotId = undefined;
+      // Note: robotId is retained for audit trail in terminal state
       order.history.push({
         at: this.clock(),
         from,
@@ -181,11 +210,15 @@ export class OrderBook {
   }
 
   /**
-   * Find order assigned to a specific robot.
+   * Find order assigned to a specific robot (ACTIVE states only).
+   * Returns only orders in dispatched or underway status.
+   * Terminal orders (completed, failed, canceled) retain robotId for audit but are never returned.
    */
   byRobot(robotId: RobotId): TransportOrder | undefined {
     return Array.from(this.orders.values()).find(
-      (order) => order.robotId === robotId
+      (order) =>
+        order.robotId === robotId &&
+        (order.status === "dispatched" || order.status === "underway")
     );
   }
 

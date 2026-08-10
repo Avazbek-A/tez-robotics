@@ -134,6 +134,15 @@ describe("OrderBook", () => {
     it("should throw on nonexistent order ID", () => {
       expect(() => orderBook.transition("ord-99999", "dispatched")).toThrow(IllegalTransition);
     });
+
+    it("should throw on transition from canceled to anything", () => {
+      const order = orderBook.create("n0_0", "n2_2");
+      orderBook.transition(order.id, "canceled");
+
+      expect(() => orderBook.transition(order.id, "queued")).toThrow(IllegalTransition);
+      expect(() => orderBook.transition(order.id, "dispatched")).toThrow(IllegalTransition);
+      expect(() => orderBook.transition(order.id, "completed")).toThrow(IllegalTransition);
+    });
   });
 
   describe("requeue", () => {
@@ -303,6 +312,44 @@ describe("OrderBook", () => {
     });
   });
 
+  describe("assign", () => {
+    it("should transition queued → dispatched and set robotId atomically", () => {
+      const order = orderBook.create("n0_0", "n2_2");
+      const assigned = orderBook.assign(order.id, "robot-001" as any);
+
+      expect(assigned.status).toBe("dispatched");
+      expect(assigned.robotId).toBe("robot-001");
+    });
+
+    it("should record assignment in history", () => {
+      const order = orderBook.create("n0_0", "n2_2");
+      const assigned = orderBook.assign(order.id, "robot-001" as any);
+
+      expect(assigned.history.length).toBe(1);
+      expect(assigned.history[0]).toEqual({
+        at: now,
+        from: "queued",
+        to: "dispatched",
+        reason: "Assigned to robot-001",
+      });
+    });
+
+    it("should throw on assign from non-queued status", () => {
+      const order = orderBook.create("n0_0", "n2_2");
+      orderBook.assign(order.id, "robot-001" as any);
+
+      expect(() => orderBook.assign(order.id, "robot-002" as any)).toThrow(
+        IllegalTransition
+      );
+    });
+
+    it("should throw on assign to nonexistent order", () => {
+      expect(() => orderBook.assign("ord-99999", "robot-001" as any)).toThrow(
+        IllegalTransition
+      );
+    });
+  });
+
   describe("byRobot", () => {
     it("should return undefined when no order for robot", () => {
       const result = orderBook.byRobot("robot-001" as any);
@@ -310,13 +357,66 @@ describe("OrderBook", () => {
       expect(result).toBeUndefined();
     });
 
-    it("should return order assigned to robot", () => {
+    it("should return order assigned to robot in active state", () => {
       const order = orderBook.create("n0_0", "n2_2");
-      const assigned = orderBook.transition(order.id, "dispatched");
+      const assigned = orderBook.assign(order.id, "robot-001" as any);
 
-      // Need to figure out how robotId is set - checking the brief again
-      // The brief says "dispatched sets robotId (transition(id,"dispatched") needs robot — extend signature per brief if specified, else add optional `robotId?` third param and document)"
-      // Since I don't see a specification, I'll add it as optional third param
+      expect(orderBook.byRobot("robot-001" as any)).toEqual(assigned);
+    });
+
+    it("should return order in underway state", () => {
+      const order = orderBook.create("n0_0", "n2_2");
+      const assigned = orderBook.assign(order.id, "robot-001" as any);
+      const underway = orderBook.transition(assigned.id, "underway");
+
+      expect(orderBook.byRobot("robot-001" as any)).toEqual(underway);
+    });
+
+    it("should not return completed order even though robotId is set", () => {
+      const order = orderBook.create("n0_0", "n2_2");
+      const assigned = orderBook.assign(order.id, "robot-001" as any);
+      const underway = orderBook.transition(assigned.id, "underway");
+      const completed = orderBook.transition(underway.id, "completed");
+
+      // robotId is retained for audit
+      expect(completed.robotId).toBe("robot-001");
+      // But byRobot returns undefined (terminal state)
+      expect(orderBook.byRobot("robot-001" as any)).toBeUndefined();
+    });
+
+    it("should not return failed order even though robotId is set", () => {
+      const order = orderBook.create("n0_0", "n2_2");
+      const assigned = orderBook.assign(order.id, "robot-001" as any);
+      const retry1 = orderBook.requeue(assigned.id, "Retry 1");
+      const assigned2 = orderBook.assign(retry1.id, "robot-001" as any);
+      const retry2 = orderBook.requeue(assigned2.id, "Retry 2");
+      const assigned3 = orderBook.assign(retry2.id, "robot-001" as any);
+      const failed = orderBook.requeue(assigned3.id, "Max retries");
+
+      // robotId is retained for audit
+      expect(failed.robotId).toBe("robot-001");
+      // But byRobot returns undefined (terminal state)
+      expect(orderBook.byRobot("robot-001" as any)).toBeUndefined();
+    });
+
+    it("should not return canceled order even though robotId is set", () => {
+      const order = orderBook.create("n0_0", "n2_2");
+      const assigned = orderBook.assign(order.id, "robot-001" as any);
+      const canceled = orderBook.transition(assigned.id, "canceled");
+
+      // robotId is retained for audit
+      expect(canceled.robotId).toBe("robot-001");
+      // But byRobot returns undefined (terminal state)
+      expect(orderBook.byRobot("robot-001" as any)).toBeUndefined();
+    });
+
+    it("should clear robotId on requeue", () => {
+      const order = orderBook.create("n0_0", "n2_2");
+      const assigned = orderBook.assign(order.id, "robot-001" as any);
+      const requeued = orderBook.requeue(assigned.id, "Retry");
+
+      expect(requeued.robotId).toBeUndefined();
+      expect(orderBook.byRobot("robot-001" as any)).toBeUndefined();
     });
   });
 
