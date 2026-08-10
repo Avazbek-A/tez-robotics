@@ -193,6 +193,25 @@ export class Vda5050Adapter implements RobotAdapter {
    * currently-live attempt) — it must keep incrementing across
    * cancel/terminal cycles so a third attempt at the same missionId gets
    * `#2`, not a repeat of `#0`.
+   *
+   * Operational growth note (documented rather than pruned, by design):
+   * this map holds exactly one entry per DISTINCT `(robotId, missionId)`
+   * pair the adapter has ever seen, for the lifetime of the process. Since
+   * `Orchestrator` mints mission ids as `${orderId}:pick`/`${orderId}:drop`
+   * and `orderId`s are minted fresh per transport order, growth is
+   * proportional to total orders processed (roughly 2 entries/order) —
+   * unbounded over a long-running process, but each entry is a tiny
+   * `string -> number` pair, so this is a slow, low-memory-per-entry
+   * growth, not a leak in the "holds onto large objects" sense.
+   * Pruning on `orders`-entry-clear was deliberately NOT implemented: an
+   * entry can only safely be dropped once we're certain the corresponding
+   * `vdaOrderId` (and, transitively, any retained-message or cached
+   * library-side state referencing it) will never be revisited, which
+   * isn't something this adapter can determine on its own without
+   * re-introducing the exact ambiguity C1 fixes. If this ever needs
+   * bounding in practice (e.g. a process that runs for a very long time
+   * across a very large number of orders), an LRU or periodic sweep keyed
+   * on `orders`-entry-clear time would be the place to add it.
    */
   private readonly attemptCounters = new Map<string, number>();
   private readonly lastNodeIdByRobot = new Map<RobotId, string>();

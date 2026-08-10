@@ -511,7 +511,7 @@ describe("Orchestrator", () => {
   });
 
   describe("I1: premature missionDone (frontier race)", () => {
-    it("rejects a done report that arrives before the robot's known position reaches the leg goal, then recovers via requeue", () => {
+    it("(b) genuine early done: rejects a done report that arrives before the robot's known position reaches the leg goal, then recovers via requeue", () => {
       const map = grid(5);
       const adapter = new ScriptableAdapter(
         [
@@ -581,6 +581,126 @@ describe("Orchestrator", () => {
         completed = found?.status === "completed";
       }
       expect(completed).toBe(true);
+    });
+
+    it("(a) same-batch freshness: accepts a done report immediately following a same-batch goal-arrival state event", () => {
+      // Regression test for a round-2 review finding: the original I1 fix
+      // read rt.currentNodeId, which resolveCurrentNodes() only refreshes
+      // ONCE PER TICK, AFTER the whole event-drain loop. When a real
+      // adapter's goal-arrival "state" event and the accompanying
+      // missionDone land in the SAME drain batch (state first, per FIFO —
+      // exactly what Vda5050Adapter produces: handleState emits
+      // missionProgress/state from one message, and a closely-following
+      // onOrderProcessed(active:false) settlement can queue its
+      // missionDone before the next tick drains), the guard used to still
+      // see LAST TICK's stale node and misclassify a genuinely on-time
+      // completion as premature — reproduced as integration-test flakiness
+      // (2 failures in 5 runs, one driving an order to permanent "failed"
+      // via 3 false requeues). Fixed by updating rt.currentNodeId INLINE
+      // as each event in the batch is handled (see handleEvent's "state"
+      // case), not just once at the end of the tick.
+      const map = grid(5);
+      const adapter = new ScriptableAdapter(
+        [
+          { id: "r1", startNodeId: "n0_0" },
+          { id: "r2", startNodeId: "n4_4" },
+        ],
+        map
+      );
+      const clock = fakeClock();
+      const orchestrator = new Orchestrator(map, adapter, { now: clock.now });
+
+      const order = orchestrator.submitOrder("n1_0", "n4_4");
+
+      let underway = false;
+      for (let i = 0; i < 10 && !underway; i++) {
+        step(orchestrator, adapter);
+        const found = orchestrator.snapshot().orders.find((o) => o.id === order.id);
+        underway = found?.status === "underway";
+      }
+      expect(underway).toBe(true);
+
+      const beforeState = orchestrator.snapshot().robots.find((r) => r.id === "r1");
+      expect(beforeState).toBeDefined();
+
+      // Fabricate the same-batch sequence: a state event showing r1 has
+      // physically arrived at the leg's goal node, immediately followed —
+      // same tick's drain batch, no tickOnce() call in between — by the
+      // corresponding missionDone.
+      const goalPos = map.node("n4_4").pos;
+      adapter.injectEvent({
+        type: "state",
+        state: { ...beforeState!, pos: goalPos, status: "EXECUTING" },
+      });
+      adapter.injectEvent({
+        type: "missionDone",
+        robotId: "r1",
+        missionId: `${order.id}:drop`,
+      });
+      orchestrator.tickOnce();
+
+      expect(orchestrator.getAlarms().some((a) => a.includes("premature missionDone"))).toBe(false);
+      const afterOrder = orchestrator.snapshot().orders.find((o) => o.id === order.id);
+      expect(afterOrder?.status).toBe("completed");
+    });
+
+    it("accepts a done report via authoritative lastVdaNodeId even when a same-batch state event's position snap disagrees", () => {
+      // The state event's positional snap and a missionProgress event's
+      // VDA lastNodeId both derive from the same underlying AGV message,
+      // but the snap can occasionally lag. This verifies the independent
+      // rt.lastVdaNodeId signal (persisted, untouched by the "state"
+      // handler's snap recompute) alone is enough to accept the done —
+      // "lastNodeId beats snap" — even if a same-batch state event still
+      // reports the OLD position.
+      const map = grid(5);
+      const adapter = new ScriptableAdapter(
+        [
+          { id: "r1", startNodeId: "n0_0" },
+          { id: "r2", startNodeId: "n4_4" },
+        ],
+        map
+      );
+      const clock = fakeClock();
+      const orchestrator = new Orchestrator(map, adapter, { now: clock.now });
+
+      const order = orchestrator.submitOrder("n1_0", "n4_4");
+
+      let underway = false;
+      for (let i = 0; i < 10 && !underway; i++) {
+        step(orchestrator, adapter);
+        const found = orchestrator.snapshot().orders.find((o) => o.id === order.id);
+        underway = found?.status === "underway";
+      }
+      expect(underway).toBe(true);
+
+      const staleState = orchestrator.snapshot().robots.find((r) => r.id === "r1");
+      expect(staleState).toBeDefined();
+      // Sanity: r1's actual last-known position is NOT the goal.
+      expect(staleState?.pos).not.toEqual(map.node("n4_4").pos);
+
+      adapter.injectEvent({
+        type: "missionProgress",
+        robotId: "r1",
+        missionId: `${order.id}:drop`,
+        lastNodeId: "n4_4",
+      });
+      // A lagging state snapshot arriving right after, in the SAME batch,
+      // still reporting the OLD (stale) position — must NOT regress the
+      // guard's decision away from what missionProgress just confirmed.
+      adapter.injectEvent({
+        type: "state",
+        state: { ...staleState!, status: "EXECUTING" },
+      });
+      adapter.injectEvent({
+        type: "missionDone",
+        robotId: "r1",
+        missionId: `${order.id}:drop`,
+      });
+      orchestrator.tickOnce();
+
+      expect(orchestrator.getAlarms().some((a) => a.includes("premature missionDone"))).toBe(false);
+      const afterOrder = orchestrator.snapshot().orders.find((o) => o.id === order.id);
+      expect(afterOrder?.status).toBe("completed");
     });
   });
 });

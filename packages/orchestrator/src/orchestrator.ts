@@ -38,6 +38,18 @@ interface RobotRuntime {
   offlineHandled: boolean;
   quarantined: boolean;
   currentNodeId?: string;
+  /**
+   * Most recent VDA5050 `lastNodeId` reported via a `missionProgress`
+   * event, persisted across ticks until it changes again (missionProgress
+   * only fires ON CHANGE — see `Vda5050Adapter.handleState`). Tracked
+   * independently of `currentNodeId`'s positional-snap derivation: used as
+   * an authoritative secondary signal by `handleMissionDone`'s
+   * frontier-race guard, since a same-tick positional snap can
+   * occasionally still resolve to the PREVIOUS node even after the AGV
+   * itself has already confirmed reaching the next one (see that guard's
+   * doc comment).
+   */
+  lastVdaNodeId?: string;
   idleSinceTick?: number;
   leg?: RobotLeg;
 }
@@ -209,17 +221,34 @@ export class Orchestrator {
   private handleEvent(e: AdapterEvent): void {
     switch (e.type) {
       case "state": {
-        const rt = this.robots.get(e.state.id);
+        let rt = this.robots.get(e.state.id);
         if (rt) {
           rt.state = e.state;
         } else {
-          this.robots.set(e.state.id, {
+          rt = {
             state: e.state,
             online: true,
             offlineHandled: false,
             quarantined: false,
-          });
+          };
+          this.robots.set(e.state.id, rt);
         }
+        // Frontier-race fix: recompute this robot's known node INLINE,
+        // immediately — not just once per tick at the very end via
+        // resolveCurrentNodes(). Events in this tick's batch are handled
+        // strictly in arrival order (see runTick()); resolveCurrentNodes()
+        // only runs AFTER the whole batch is drained, so without this, a
+        // missionDone landing later in the SAME batch (e.g. right after
+        // the state event that shows the robot has reached its goal) would
+        // still see whatever currentNodeId was left over from the END of
+        // the PREVIOUS tick, misclassifying a genuinely on-time completion
+        // as premature. See handleMissionDone's frontier-race guard.
+        const snapped = this.snapToNode(rt.state.pos);
+        if (snapped !== undefined) {
+          rt.currentNodeId = snapped;
+        }
+        // else: leave currentNodeId as whatever it was; resolveCurrentNodes()'s
+        // end-of-tick fallback/quarantine pass handles the unresolved case.
         break;
       }
       case "connection": {
@@ -234,10 +263,24 @@ export class Orchestrator {
         }
         break;
       }
-      case "missionProgress":
-        // Informational; position/status bookkeeping arrives via the
-        // accompanying "state" heartbeat event.
+      case "missionProgress": {
+        const rt = this.robots.get(e.robotId);
+        if (!rt) break; // no known state yet for this robot; ignore
+        rt.lastVdaNodeId = e.lastNodeId;
+        // Authoritative per VDA5050 protocol semantics: the AGV itself is
+        // reporting it has reached this node. Apply to currentNodeId
+        // immediately too (not just lastVdaNodeId) so any LATER event in
+        // this same batch sees it — mirrors the "state" case above. Per
+        // the RobotAdapter per-tick event-ordering contract, missionProgress
+        // fires BEFORE its accompanying state event, so that later state
+        // event's positional-snap recompute (above) may still run after
+        // this and land on the same node (the common case) or, rarely,
+        // lag behind it — which is exactly why lastVdaNodeId is ALSO kept
+        // as an independent, never-overwritten-by-snap signal for
+        // handleMissionDone's guard.
+        rt.currentNodeId = e.lastNodeId;
         break;
+      }
       case "missionDone":
         this.handleMissionDone(e.robotId, e.missionId);
         break;
@@ -314,33 +357,46 @@ export class Orchestrator {
 
     // I1: frontier-race guard. A real (non-lockstepped) adapter can
     // truthfully report the wire-level mission it most recently sent as
-    // fully processed before this robot's LAST KNOWN node (rt.currentNodeId,
-    // as of resolveCurrentNodes() this tick) has actually caught up to the
-    // leg's goal node — e.g. Vda5050Adapter only ever releases one more base
-    // node per tick (see its sendMission doc comment), so a fast-moving AGV
-    // can drain its currently-released path and report the VDA order
-    // "done" before the orchestrator has appended/sent the next extension.
+    // fully processed before this robot's LAST KNOWN node has actually
+    // caught up to the leg's goal node — e.g. Vda5050Adapter only ever
+    // releases one more base node per tick (see its sendMission doc
+    // comment), so a fast-moving AGV can drain its currently-released path
+    // and report the VDA order "done" before the orchestrator has
+    // appended/sent the next extension. rt.currentNodeId is now kept
+    // batch-fresh (updated inline by handleEvent's "state"/"missionProgress"
+    // cases, not just once per tick at the end via resolveCurrentNodes() —
+    // see that fix's comments there), so a same-batch goal-arrival state
+    // event immediately followed by this missionDone is seen correctly.
+    // As a second, independent signal, also accept `rt.lastVdaNodeId`
+    // (from the most recent missionProgress event, persisted across
+    // ticks) reaching the goal — the AGV's own reported lastNodeId is
+    // authoritative and can occasionally be ahead of what a position snap
+    // resolves to, regardless of update ordering within a batch.
+    //
     // Only intercept when the CURRENT leg genuinely matches this missionId
     // (rt.leg.missionId === missionId) — if it doesn't match at all (no
     // leg, or a different leg/order entirely), that's the pre-existing
     // "stale report" case already handled below via book.transition()'s
     // own try/catch, and must NOT be touched here.
-    if (rt.leg && rt.leg.missionId === missionId && rt.currentNodeId !== rt.leg.goalNode) {
-      this.alarms.push(
-        `t=${this.tickCount} premature missionDone from robot ${robotId} for order ${orderId} ` +
-          `(leg=${leg}, at=${String(rt.currentNodeId)}, goal=${rt.leg.goalNode}) — cancelling and requeueing`
-      );
-      void this.adapter.cancelMission(robotId).catch(() => {
-        /* best-effort; robot may be unreachable */
-      });
-      try {
-        this.book.requeue(orderId, "premature missionDone (frontier race)");
-      } catch {
-        /* already terminal */
+    if (rt.leg && rt.leg.missionId === missionId) {
+      const reachedGoal = rt.currentNodeId === rt.leg.goalNode || rt.lastVdaNodeId === rt.leg.goalNode;
+      if (!reachedGoal) {
+        this.alarms.push(
+          `t=${this.tickCount} premature missionDone from robot ${robotId} for order ${orderId} ` +
+            `(leg=${leg}, at=${String(rt.currentNodeId)}, lastVdaNodeId=${String(rt.lastVdaNodeId)}, goal=${rt.leg.goalNode}) — cancelling and requeueing`
+        );
+        void this.adapter.cancelMission(robotId).catch(() => {
+          /* best-effort; robot may be unreachable */
+        });
+        try {
+          this.book.requeue(orderId, "premature missionDone (frontier race)");
+        } catch {
+          /* already terminal */
+        }
+        this.reservations.releaseAll(robotId);
+        rt.leg = undefined;
+        return;
       }
-      this.reservations.releaseAll(robotId);
-      rt.leg = undefined;
-      return;
     }
 
     if (leg === "pick") {
@@ -397,10 +453,31 @@ export class Orchestrator {
     this.alarms.push(`t=${this.tickCount} mission failed for robot ${robotId}: ${reason}`);
   }
 
+  /**
+   * Per-tick fallback/quarantine pass. Batch-freshness fix: `rt.currentNodeId`
+   * may already have been set THIS tick — or carried over unchanged from a
+   * prior one, which is fine, that just means "no new information arrived"
+   * — by inline event handling in `handleEvent`'s "state"/"missionProgress"
+   * cases. This method must NOT blindly re-derive/overwrite it from
+   * `rt.state.pos`: that positional snap can occasionally lag behind a
+   * more authoritative `missionProgress`-derived value (see
+   * `RobotRuntime.lastVdaNodeId`'s doc comment), and clobbering it here
+   * would silently undo that fix for anything reading `currentNodeId`
+   * afterward this tick (dispatch/routing). Only derive fresh when nothing
+   * has resolved a node yet, or defensively if what's already there
+   * somehow isn't a real map node — otherwise this is purely the
+   * quarantine-transition/reservation/leg-seeding bookkeeping pass it
+   * always was.
+   */
   private resolveCurrentNodes(): void {
     for (const [id, rt] of this.robots) {
-      const key = cellKey(rt.state.pos);
-      const nodeId = this.posToNode.get(key);
+      let nodeId = rt.currentNodeId;
+      if (nodeId !== undefined && !this.map.nodeIds.includes(nodeId)) {
+        nodeId = undefined;
+      }
+      if (nodeId === undefined) {
+        nodeId = this.snapToNode(rt.state.pos);
+      }
 
       if (nodeId === undefined) {
         rt.currentNodeId = undefined;
@@ -408,7 +485,7 @@ export class Orchestrator {
           rt.quarantined = true;
           rt.state.status = "ERROR";
           this.alarms.push(
-            `t=${this.tickCount} robot ${id} at unresolvable position ${key} — quarantined`
+            `t=${this.tickCount} robot ${id} at unresolvable position ${cellKey(rt.state.pos)} — quarantined`
           );
           const order = this.book.byRobot(asCoreRobotId(id));
           if (order) {
@@ -422,9 +499,10 @@ export class Orchestrator {
           rt.leg = undefined;
           // Best-effort: stop it executing whatever stale mission it still
           // thinks it has, so it doesn't quietly finish that mission later
-          // (feeding the same stale-report class of bug the C1 guard
-          // handles) and so a reused mission id on un-quarantine doesn't
-          // hit the adapter's non-prefix-extension rejection.
+          // (feeding the same stale-report class of bug the stale-reporter
+          // guard above handles) and so a reused mission id on
+          // un-quarantine doesn't hit the adapter's non-prefix-extension
+          // rejection.
           void this.adapter.cancelMission(id).catch(() => {
             /* best-effort; robot may be unreachable */
           });
@@ -439,11 +517,15 @@ export class Orchestrator {
       }
 
       rt.currentNodeId = nodeId;
-      this.reservations.release(id, key);
+      this.reservations.release(id, cellKey(this.map.node(nodeId).pos));
       if (rt.leg && rt.leg.nodeIds.length === 0) {
         rt.leg.nodeIds = [nodeId];
       }
     }
+  }
+
+  private snapToNode(pos: RobotState["pos"]): string | undefined {
+    return this.posToNode.get(cellKey(pos));
   }
 
   private handleOfflineTimeouts(): void {
