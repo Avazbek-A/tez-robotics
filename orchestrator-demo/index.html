@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tez Robotics — Fleet Orchestrator</title>
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <div id="app">
+    <header id="topbar">
+      <div class="brand">
+        <span class="logo">⬡</span>
+        <span class="brand-name">Tez Robotics</span>
+        <span class="brand-sub" data-i18n="subtitle">Fleet Orchestrator — демо-симуляция</span>
+      </div>
+      <div class="top-controls">
+        <div class="lang-switch">
+          <button data-lang="ru" class="active">RU</button>
+          <button data-lang="uz">UZ</button>
+          <button data-lang="en">EN</button>
+        </div>
+      </div>
+    </header>
+    <main>
+      <section id="canvas-wrap">
+        <canvas id="warehouse"></canvas>
+        <div id="sim-controls">
+          <button id="btn-pause" title="Пауза">⏸</button>
+          <div class="speed">
+            <button data-speed="1" class="active">1×</button>
+            <button data-speed="4">4×</button>
+            <button data-speed="10">10×</button>
+          </div>
+          <label class="slider-label"><span data-i18n="robots">Роботы</span>
+            <input type="range" id="robot-count" min="2" max="16" value="8" />
+            <span id="robot-count-val">8</span>
+          </label>
+          <label class="slider-label"><span data-i18n="orderRate">Поток заказов</span>
+            <input type="range" id="order-rate" min="1" max="10" value="4" />
+            <span id="order-rate-val">4</span>
+          </label>
+        </div>
+      </section>
+      <aside id="panel">
+        <h2 data-i18n="kpiTitle">Показатели смены</h2>
+        <div class="kpi-grid">
+          <div class="kpi"><div class="kpi-value" id="kpi-done">0</div><div class="kpi-label" data-i18n="kpiDone">Заказов выполнено</div></div>
+          <div class="kpi"><div class="kpi-value" id="kpi-rate">0</div><div class="kpi-label" data-i18n="kpiRate">Заказов / час</div></div>
+          <div class="kpi"><div class="kpi-value" id="kpi-cycle">—</div><div class="kpi-label" data-i18n="kpiCycle">Средний цикл, с</div></div>
+          <div class="kpi"><div class="kpi-value" id="kpi-util">0%</div><div class="kpi-label" data-i18n="kpiUtil">Загрузка флота</div></div>
+          <div class="kpi"><div class="kpi-value" id="kpi-dist">0</div><div class="kpi-label" data-i18n="kpiDist">Пробег, м</div></div>
+          <div class="kpi"><div class="kpi-value" id="kpi-queue">0</div><div class="kpi-label" data-i18n="kpiQueue">Очередь заказов</div></div>
+        </div>
+        <div class="savings">
+          <div class="savings-line"><span data-i18n="savedWalk">Сэкономлено ходьбы персонала</span><b id="kpi-walk">0 км</b></div>
+        </div>
+        <h2 data-i18n="feedTitle">Заказы из 1C / WMS</h2>
+        <ul id="order-feed"></ul>
+        <h2 data-i18n="fleetTitle">Флот</h2>
+        <ul id="fleet-list"></ul>
+        <footer>
+          <span data-i18n="footer">Демо: назначение задач, маршрутизация A*, разрешение конфликтов, зарядка. Роботы — серийные AMR; платформа — Tez Robotics.</span>
+        </footer>
+      </aside>
+    </main>
+  </div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

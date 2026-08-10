@@ -1,0 +1,123 @@
+:root {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --panel2: #1c2330;
+  --border: #2a3343;
+  --text: #e6edf3;
+  --muted: #8b98a9;
+  --accent: #22d3ee;
+  --accent2: #34d399;
+  --warn: #fbbf24;
+  --danger: #f87171;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body, #app { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Inter", "Segoe UI", system-ui, sans-serif;
+  overflow: hidden;
+}
+#app { display: flex; flex-direction: column; }
+
+#topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 18px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+.brand { display: flex; align-items: baseline; gap: 10px; }
+.logo { color: var(--accent); font-size: 22px; }
+.brand-name { font-size: 18px; font-weight: 700; letter-spacing: 0.5px; }
+.brand-sub { color: var(--muted); font-size: 13px; }
+.lang-switch button {
+  background: none; border: 1px solid var(--border); color: var(--muted);
+  padding: 4px 10px; cursor: pointer; font-size: 12px;
+}
+.lang-switch button:first-child { border-radius: 6px 0 0 6px; }
+.lang-switch button:last-child { border-radius: 0 6px 6px 0; }
+.lang-switch button.active { color: var(--bg); background: var(--accent); border-color: var(--accent); }
+
+main { flex: 1; display: flex; min-height: 0; }
+
+#canvas-wrap { flex: 1; position: relative; display: flex; }
+#warehouse { flex: 1; width: 100%; height: 100%; display: block; }
+
+#sim-controls {
+  position: absolute; left: 14px; bottom: 14px;
+  display: flex; align-items: center; gap: 14px;
+  background: rgba(22, 27, 34, 0.92);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 14px;
+  font-size: 12px;
+}
+#sim-controls button {
+  background: var(--panel2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 5px 10px; cursor: pointer; font-size: 13px;
+}
+#sim-controls .speed button.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+.slider-label { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+.slider-label input { accent-color: var(--accent); }
+.slider-label span:last-child { color: var(--text); min-width: 16px; text-align: right; }
+
+#panel {
+  width: 320px; background: var(--panel);
+  border-left: 1px solid var(--border);
+  padding: 16px; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 12px;
+}
+#panel h2 {
+  font-size: 12px; text-transform: uppercase; letter-spacing: 1px;
+  color: var(--muted); margin-top: 6px;
+}
+.kpi-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+.kpi {
+  background: var(--panel2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 8px; text-align: center;
+}
+.kpi-value { font-size: 20px; font-weight: 700; color: var(--accent); }
+.kpi-label { font-size: 10px; color: var(--muted); margin-top: 4px; line-height: 1.3; }
+
+.savings {
+  background: linear-gradient(90deg, rgba(52,211,153,0.12), transparent);
+  border: 1px solid rgba(52,211,153,0.35);
+  border-radius: 8px; padding: 10px 12px; font-size: 12px;
+}
+.savings-line { display: flex; justify-content: space-between; gap: 8px; }
+.savings-line b { color: var(--accent2); }
+
+#order-feed { list-style: none; font-size: 12px; max-height: 150px; overflow: hidden; }
+#order-feed li {
+  display: flex; justify-content: space-between;
+  padding: 5px 8px; border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  animation: slideIn 0.3s ease;
+}
+#order-feed li .oid { color: var(--text); font-weight: 600; }
+#order-feed li .status-new { color: var(--warn); }
+#order-feed li .status-assigned { color: var(--accent); }
+#order-feed li .status-done { color: var(--accent2); }
+@keyframes slideIn { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; } }
+
+#fleet-list { list-style: none; font-size: 12px; }
+#fleet-list li {
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 8px; color: var(--muted);
+}
+#fleet-list .dot { width: 8px; height: 8px; border-radius: 50%; }
+#fleet-list .battery { margin-left: auto; font-variant-numeric: tabular-nums; }
+
+#panel footer {
+  margin-top: auto; font-size: 10.5px; color: var(--muted);
+  border-top: 1px solid var(--border); padding-top: 10px; line-height: 1.5;
+}
+
+@media (max-width: 900px) {
+  body { overflow: auto; }
+  main { flex-direction: column; }
+  #canvas-wrap { min-height: 58vh; }
+  #panel { width: 100%; border-left: none; border-top: 1px solid var(--border); }
+  #sim-controls { flex-wrap: wrap; gap: 8px; max-width: calc(100% - 28px); }
+}

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "orchestrator-demo",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--prefix", "/Users/avazbek/Desktop/Repository/tez-robotics/orchestrator-demo", "--", "--port", "5199", "--strictPort"],
+      "port": 5199
+    }
+  ]
+}
