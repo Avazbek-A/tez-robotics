@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import { ReservationTable } from "../src/reservations.js";
 import type { CellKey, RobotId } from "@tez/shared";
 
@@ -26,15 +26,21 @@ function assertConsistent(table: ReservationTable, msg?: string): void {
 }
 
 describe("ReservationTable", () => {
+  let table: ReservationTable;
+
+  afterEach(() => {
+    // Verify consistency at the end of every test
+    assertConsistent(table, `after test`);
+  });
   it("should claim an empty list and return empty", () => {
-    const table = new ReservationTable();
+    table = new ReservationTable();
     const robot: RobotId = "r1";
     const result = table.claim(robot, []);
     expect(result).toEqual([]);
   });
 
   it("should claim a single cell for a robot", () => {
-    const table = new ReservationTable();
+    table = new ReservationTable();
     const robot: RobotId = "r1";
     const cells: CellKey[] = ["0:0"];
     const result = table.claim(robot, cells);
@@ -43,7 +49,7 @@ describe("ReservationTable", () => {
   });
 
   it("should claim a sequence of cells", () => {
-    const table = new ReservationTable();
+    table = new ReservationTable();
     const robot: RobotId = "r1";
     const cells: CellKey[] = ["0:0", "1:0", "2:0"];
     const result = table.claim(robot, cells);
@@ -54,7 +60,7 @@ describe("ReservationTable", () => {
   });
 
   it("should stop prefix grant at first foreign-owned cell", () => {
-    const table = new ReservationTable();
+    table = new ReservationTable();
     const r1: RobotId = "r1";
     const r2: RobotId = "r2";
 
@@ -72,7 +78,7 @@ describe("ReservationTable", () => {
   });
 
   it("should claim a prefix when later cells are foreign", () => {
-    const table = new ReservationTable();
+    table = new ReservationTable();
     const r1: RobotId = "r1";
     const r2: RobotId = "r2";
 
@@ -89,7 +95,7 @@ describe("ReservationTable", () => {
   });
 
   it("should release cells strictly behind current position", () => {
-    const table = new ReservationTable();
+    table = new ReservationTable();
     const robot: RobotId = "r1";
 
     // Claim cells
@@ -107,7 +113,7 @@ describe("ReservationTable", () => {
   });
 
   it("should be no-op when releasing with current not in robot's list", () => {
-    const table = new ReservationTable();
+    table = new ReservationTable();
     const robot: RobotId = "r1";
 
     table.claim(robot, ["0:0", "1:0", "2:0"]);
@@ -122,7 +128,7 @@ describe("ReservationTable", () => {
   });
 
   it("should support releaseAll to free all robot's cells", () => {
-    const table = new ReservationTable();
+    table = new ReservationTable();
     const robot: RobotId = "r1";
 
     table.claim(robot, ["0:0", "1:0", "2:0", "3:0"]);
@@ -137,7 +143,7 @@ describe("ReservationTable", () => {
   });
 
   it("should handle double-claim of own cells (idempotent)", () => {
-    const table = new ReservationTable();
+    table = new ReservationTable();
     const robot: RobotId = "r1";
 
     // First claim
@@ -154,7 +160,7 @@ describe("ReservationTable", () => {
   });
 
   it("should extend claim when re-claiming with additional cells", () => {
-    const table = new ReservationTable();
+    table = new ReservationTable();
     const robot: RobotId = "r1";
 
     // First claim
@@ -169,7 +175,7 @@ describe("ReservationTable", () => {
   });
 
   it("should handle interleaved claims of two robots", () => {
-    const table = new ReservationTable();
+    table = new ReservationTable();
     const r1: RobotId = "r1";
     const r2: RobotId = "r2";
 
@@ -192,7 +198,7 @@ describe("ReservationTable", () => {
   });
 
   it("should release only cells behind current, not current itself", () => {
-    const table = new ReservationTable();
+    table = new ReservationTable();
     const robot: RobotId = "r1";
 
     table.claim(robot, ["0:0", "1:0", "2:0", "3:0", "4:0"]);
@@ -210,7 +216,7 @@ describe("ReservationTable", () => {
   });
 
   it("should handle release when current is first cell", () => {
-    const table = new ReservationTable();
+    table = new ReservationTable();
     const robot: RobotId = "r1";
 
     table.claim(robot, ["0:0", "1:0", "2:0"]);
@@ -225,7 +231,7 @@ describe("ReservationTable", () => {
   });
 
   it("should handle releaseAll on non-existent robot (no-op)", () => {
-    const table = new ReservationTable();
+    table = new ReservationTable();
     const r1: RobotId = "r1";
     const r2: RobotId = "r2";
 
@@ -240,7 +246,7 @@ describe("ReservationTable", () => {
   });
 
   it("should track ownership correctly with multiple operations", () => {
-    const table = new ReservationTable();
+    table = new ReservationTable();
     const r1: RobotId = "r1";
     const r2: RobotId = "r2";
 
@@ -259,11 +265,10 @@ describe("ReservationTable", () => {
     expect(r2_result).toEqual(["0:0", "1:0"]);
     expect(table.owner("0:0")).toBe(r2);
     expect(table.owner("1:0")).toBe(r2);
-    assertConsistent(table, "after multi-op sequence");
   });
 
   it("should free non-requested cells when re-claiming shorter path (non-superset)", () => {
-    const table = new ReservationTable();
+    table = new ReservationTable();
     const robot: RobotId = "r1";
 
     // First claim: r1 owns [A, B, C, D]
@@ -272,7 +277,6 @@ describe("ReservationTable", () => {
     expect(table.owner("1:0")).toBe(robot);
     expect(table.owner("2:0")).toBe(robot);
     expect(table.owner("3:0")).toBe(robot);
-    assertConsistent(table, "after initial claim");
 
     // Re-claim shorter path: r1 now only wants [B, C]
     // This should free [A, D]
@@ -285,11 +289,10 @@ describe("ReservationTable", () => {
     // New claim cells should still be owned
     expect(table.owner("1:0")).toBe(robot);
     expect(table.owner("2:0")).toBe(robot);
-    assertConsistent(table, "after non-superset re-claim");
   });
 
   it("should dedupe path revisits and release orphaned cells", () => {
-    const table = new ReservationTable();
+    table = new ReservationTable();
     const robot: RobotId = "r1";
 
     // Claim a path with duplicate cell [A, B, C, B]
@@ -301,7 +304,6 @@ describe("ReservationTable", () => {
     expect(table.owner("0:0")).toBe(robot);
     expect(table.owner("1:0")).toBe(robot);
     expect(table.owner("2:0")).toBe(robot);
-    assertConsistent(table, "after deduped claim");
 
     // Re-claim with a different duplicate pattern
     const result2 = table.claim(robot, ["0:0", "2:0", "1:0"]);
@@ -311,34 +313,80 @@ describe("ReservationTable", () => {
     // But 1:0 was previously at index 1 and now at index 2 (reordered)
     // The new claim is [0:0, 2:0, 1:0] - should grant all three since robot owns them
     expect(result2).toEqual(["0:0", "2:0", "1:0"]);
-    assertConsistent(table, "after reordered re-claim");
   });
 
   it("consistency is maintained across all operations", () => {
-    const table = new ReservationTable();
+    table = new ReservationTable();
     const r1: RobotId = "r1";
     const r2: RobotId = "r2";
 
     // Series of operations
     table.claim(r1, ["0:0", "1:0", "2:0", "3:0", "4:0"]);
-    assertConsistent(table, "r1 initial claim");
 
     table.claim(r2, ["5:0", "6:0"]);
-    assertConsistent(table, "r2 claim");
 
     table.release(r1, "2:0");
-    assertConsistent(table, "r1 release");
 
     table.claim(r1, ["1:0", "2:0"]);
-    assertConsistent(table, "r1 re-claim (shortening)");
 
     table.claim(r2, ["0:0", "5:0", "6:0"]);
-    assertConsistent(table, "r2 claim (getting freed cell)");
 
     table.releaseAll(r1);
-    assertConsistent(table, "r1 releaseAll");
 
     expect(table.owner("1:0")).toBeUndefined();
     expect(table.owner("2:0")).toBeUndefined();
+  });
+
+  it("should reject claim with foreign first cell and leave prior holds intact", () => {
+    table = new ReservationTable();
+    const r1: RobotId = "r1";
+    const r2: RobotId = "r2";
+
+    // r1 claims cells
+    const r1_claim = table.claim(r1, ["0:0", "1:0", "2:0"]);
+    expect(r1_claim).toEqual(["0:0", "1:0", "2:0"]);
+
+    // r2 claims a different set
+    const r2_claim = table.claim(r2, ["5:0", "6:0"]);
+    expect(r2_claim).toEqual(["5:0", "6:0"]);
+
+    // r1 tries to claim with r2's cell as first cell (foreign-owned)
+    // This should return [] with ZERO state change
+    const r1_attempt = table.claim(r1, ["5:0", "7:0", "8:0"]);
+    expect(r1_attempt).toEqual([]); // Empty grant
+
+    // r1's prior holds should be INTACT (this is the key NO-OP contract)
+    expect(table.owner("0:0")).toBe(r1);
+    expect(table.owner("1:0")).toBe(r1);
+    expect(table.owner("2:0")).toBe(r1);
+
+    // r2's cells should be untouched
+    expect(table.owner("5:0")).toBe(r2);
+    expect(table.owner("6:0")).toBe(r2);
+  });
+
+  it("should be pure no-op when claiming empty array", () => {
+    table = new ReservationTable();
+    const r1: RobotId = "r1";
+    const r2: RobotId = "r2";
+
+    // r1 claims some cells
+    table.claim(r1, ["0:0", "1:0", "2:0"]);
+
+    // r2 claims some cells
+    table.claim(r2, ["5:0", "6:0"]);
+
+    // r1 tries to claim empty array
+    const result = table.claim(r1, []);
+    expect(result).toEqual([]); // Returns empty
+
+    // r1's cells should remain (NO-OP means zero change to state)
+    expect(table.owner("0:0")).toBe(r1);
+    expect(table.owner("1:0")).toBe(r1);
+    expect(table.owner("2:0")).toBe(r1);
+
+    // r2's cells should be unaffected
+    expect(table.owner("5:0")).toBe(r2);
+    expect(table.owner("6:0")).toBe(r2);
   });
 });

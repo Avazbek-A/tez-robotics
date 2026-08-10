@@ -19,14 +19,19 @@ export class ReservationTable {
 
   /**
    * Claim cells for robot; returns granted prefix (may be shorter than asked).
-   * Semantics: cells is the robot's desired hold-set in order. Grant = longest prefix
-   * where each cell is unowned OR already owned by this robot. Stops at first foreign cell.
+   * Semantics: cells is the robot's desired hold-set in path order. Callers MUST include
+   * the robot's current physical cell as the first element of each horizon claim, else
+   * an empty grant (foreign first cell) will reject and leave the robot stranded.
    *
-   * After claim, robot owns exactly the granted cells, no more/less (w.r.t. previous state).
-   * All previously owned cells NOT in granted are released.
+   * Grant = longest prefix where each cell is unowned OR already owned by this robot.
+   * Stops at first foreign-owned cell.
+   *
+   * NO-OP on empty grant: if the granted prefix is empty (first cell is foreign OR input
+   * was []), returns [] with zero state change. Robot's prior holds remain untouched.
+   * All previously owned cells NOT in granted are released ONLY when grant is non-empty.
    *
    * Path revisits are deduped (keeping first occurrence) before grant computation.
-   * Empty claim releases all robot's cells.
+   * Use releaseAll() as the only explicit full-release API.
    */
   claim(robot: RobotId, cells: CellKey[]): CellKey[] {
     // Step 1: Dedupe cells, keeping first occurrence of each unique CellKey
@@ -39,19 +44,7 @@ export class ReservationTable {
       }
     }
 
-    // Step 2: Handle empty claim (release all robot's cells)
-    if (deduped.length === 0) {
-      const prevCells = this.robotCells.get(robot);
-      if (prevCells) {
-        for (const cell of prevCells) {
-          this.cellOwner.delete(cell);
-        }
-        this.robotCells.delete(robot);
-      }
-      return [];
-    }
-
-    // Step 3: Compute granted prefix (unowned or already owned by this robot)
+    // Step 2: Compute granted prefix (unowned or already owned by this robot)
     const granted: CellKey[] = [];
     for (const cell of deduped) {
       const owner = this.cellOwner.get(cell);
@@ -63,7 +56,12 @@ export class ReservationTable {
       }
     }
 
-    // Step 4: Free all previously owned cells NOT in granted
+    // Step 3: NO-OP if grant is empty (zero state change)
+    if (granted.length === 0) {
+      return [];
+    }
+
+    // Step 4: Free all previously owned cells NOT in granted (only when grant non-empty)
     const prevCells = this.robotCells.get(robot) || [];
     const grantedSet = new Set(granted);
     for (const cell of prevCells) {
@@ -139,7 +137,7 @@ export class ReservationTable {
   _snapshot(): { cells: Map<CellKey, RobotId>; byRobot: Map<RobotId, CellKey[]> } {
     return {
       cells: new Map(this.cellOwner),
-      byRobot: new Map(this.robotCells.entries().map(([k, v]) => [k, [...v]]))
+      byRobot: new Map(Array.from(this.robotCells, ([k, v]) => [k, [...v]]))
     };
   }
 }
