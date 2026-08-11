@@ -9,6 +9,8 @@
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.5.4",
+    "@tez/core": "workspace:*",
+    "@tez/shared": "workspace:*",
     "pg": "^8.23.0"
   },
   "devDependencies": {

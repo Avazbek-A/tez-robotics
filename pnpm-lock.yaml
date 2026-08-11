@@ -88,6 +88,12 @@ importers:
       '@electric-sql/pglite':
         specifier: ^0.5.4
         version: 0.5.4
+      '@tez/core':
+        specifier: workspace:*
+        version: link:../core
+      '@tez/shared':
+        specifier: workspace:*
+        version: link:../shared
       pg:
         specifier: ^8.23.0
         version: 8.23.0
