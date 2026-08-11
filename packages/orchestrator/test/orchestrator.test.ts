@@ -2737,4 +2737,201 @@ describe("Orchestrator", () => {
       expect(completed).toBe(true);
     });
   });
+
+  describe("cancelOrder (Plan2 #17)", () => {
+    it("cancels a queued (unassigned) order", () => {
+      const map = grid(4);
+      const adapter = new FakeAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      const clock = fakeClock();
+      const orch = new Orchestrator(map, adapter, { now: clock.now });
+
+      const order = orch.submitOrder("n2_0", "n3_3");
+      expect(order.status).toBe("queued");
+
+      const result = orch.cancelOrder(order.id);
+      expect(result.id).toBe(order.id);
+      expect(result.status).toBe("canceled");
+
+      const snap = orch.snapshot();
+      expect(snap.orders.find((o) => o.id === order.id)?.status).toBe("canceled");
+    });
+
+    it("cancels an order assigned mid-leg: cancels the robot's mission, clears its leg (releasing reservations but keeping its own occupied cell), and returns the robot to the idle pool", () => {
+      const map = grid(5);
+      const adapter = new ScriptableAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      const clock = fakeClock();
+      const orch = new Orchestrator(map, adapter, { now: clock.now });
+
+      const order = orch.submitOrder("n4_0", "n4_4");
+      step(orch, adapter); // dispatch
+      step(orch, adapter); // leg starts extending
+
+      const dispatched = orch.snapshot().orders.find((o) => o.id === order.id);
+      expect(dispatched?.status).toBe("dispatched");
+      expect(dispatched?.robotId).toBe("r1");
+
+      const result = orch.cancelOrder(order.id);
+      expect(result.id).toBe(order.id);
+      expect(result.status).toBe("canceled");
+
+      // Best-effort mission cancel, mirroring the existing recovery paths.
+      expect(adapter.cancelCalls).toContain("r1");
+
+      // Own-cell re-claim after releaseAll: the robot still owns whatever
+      // cell it is physically standing on right now (collision-hole
+      // invariant — see runTick()'s ordering-invariant note).
+      const r1After = orch.snapshot().robots.find((r) => r.id === "r1")!;
+      expect(orch._reservationOwner(cellKey(r1After.pos))).toBe("r1");
+
+      // Leg cleared -> robot re-enters the idle pool and takes a new order.
+      const order2 = orch.submitOrder("n0_4", "n0_0");
+      let completed = false;
+      for (let i = 0; i < 80 && !completed; i++) {
+        step(orch, adapter);
+        completed = orch.snapshot().orders.find((o) => o.id === order2.id)?.status === "completed";
+      }
+      expect(completed).toBe(true);
+      expect(orch.snapshot().orders.find((o) => o.id === order2.id)?.robotId).toBe("r1");
+    });
+
+    it("throws for an unknown order id", () => {
+      const map = grid(3);
+      const adapter = new FakeAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      const orch = new Orchestrator(map, adapter, {});
+      expect(() => orch.cancelOrder("ord-99999")).toThrow(/order not found/);
+    });
+
+    it("throws when the order is already terminal (completed)", () => {
+      const map = grid(4);
+      const adapter = new FakeAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      const clock = fakeClock();
+      const orch = new Orchestrator(map, adapter, { now: clock.now });
+      const order = orch.submitOrder("n2_0", "n3_3");
+
+      let completed = false;
+      for (let i = 0; i < 60 && !completed; i++) {
+        step(orch, adapter);
+        completed = orch.snapshot().orders.find((o) => o.id === order.id)?.status === "completed";
+      }
+      expect(completed).toBe(true);
+
+      expect(() => orch.cancelOrder(order.id)).toThrow(/order already terminal/);
+    });
+  });
+
+  describe("snapshot retention (spec decision 1 / Plan2 #18)", () => {
+    it("bounds allOrders/snapshot to the newest N terminal orders (via cancellation), keeping every non-terminal order regardless of retention", () => {
+      const map = grid(3);
+      const adapter = new FakeAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      const clock = fakeClock();
+      const orch = new Orchestrator(map, adapter, { now: clock.now, terminalOrderRetention: 5 });
+
+      const submittedIds: string[] = [];
+      for (let i = 0; i < 8; i++) {
+        const o = orch.submitOrder("n1_1", "n2_2");
+        submittedIds.push(o.id);
+        orch.cancelOrder(o.id);
+      }
+
+      // One still-active (non-terminal) order, submitted after the
+      // terminal ones above.
+      const activeOrder = orch.submitOrder("n0_1", "n1_0");
+
+      const snap = orch.snapshot();
+      const terminalIds = snap.orders.filter((o) => o.status === "canceled").map((o) => o.id);
+      expect(terminalIds.length).toBe(5);
+      // Newest-last, stable order: the 5 kept are the LAST 5 submitted+canceled.
+      expect(terminalIds).toEqual(submittedIds.slice(-5));
+      expect(snap.orders.some((o) => o.id === activeOrder.id)).toBe(true);
+      expect(snap.orders.length).toBe(6); // 5 terminal + 1 active
+    });
+
+    it("also bounds via the completion path, and KPIs stay unaffected by pruning", () => {
+      const map = grid(4);
+      const adapter = new FakeAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      const clock = fakeClock();
+      const orch = new Orchestrator(map, adapter, { now: clock.now, terminalOrderRetention: 2 });
+
+      const ids: string[] = [];
+      for (let n = 0; n < 4; n++) {
+        const o = orch.submitOrder("n1_1", "n2_2");
+        ids.push(o.id);
+        let completed = false;
+        for (let i = 0; i < 60 && !completed; i++) {
+          step(orch, adapter);
+          completed = orch.snapshot().orders.find((x) => x.id === o.id)?.status === "completed";
+        }
+        expect(completed).toBe(true);
+      }
+
+      const snap = orch.snapshot();
+      expect(snap.orders.length).toBe(2);
+      expect(snap.orders.map((o) => o.id)).toEqual(ids.slice(-2));
+      // KPIs (completions/cycle times) are tracked independently of
+      // allOrders and must NOT be affected by pruning.
+      expect(snap.kpis.avgCycleMs).toBeGreaterThanOrEqual(0);
+    });
+  });
+
+  describe("#10 smalls: dispatch/quarantine fixes", () => {
+    it("does not dispatch a queued order to a robot that is offline but still within its grace period", () => {
+      const map = grid(4);
+      const adapter = new FakeAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      const clock = fakeClock();
+      const orch = new Orchestrator(map, adapter, { now: clock.now, offlineGraceMs: 10_000 });
+
+      adapter.tick();
+      orch.tickOnce();
+
+      adapter.setConnection("r1" as RobotId, false);
+      orch.tickOnce();
+
+      const order = orch.submitOrder("n2_0", "n3_3");
+
+      // Several ticks, well within the grace window — no retries burned,
+      // no assignment to the offline robot.
+      for (let i = 0; i < 5; i++) {
+        orch.tickOnce();
+      }
+
+      const found = orch.snapshot().orders.find((o) => o.id === order.id);
+      expect(found?.status).toBe("queued");
+      expect(found?.robotId).toBeUndefined();
+      expect(found?.retries).toBe(0);
+    });
+
+    it("keeps a quarantined robot's status pinned to ERROR through subsequent state heartbeats (position/battery still flow) until its position recovers", () => {
+      const map = grid(3);
+      const adapter = new ScriptableAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      const clock = fakeClock();
+      const orch = new Orchestrator(map, adapter, { now: clock.now });
+
+      adapter.tick();
+      orch.tickOnce();
+      const initial = orch.snapshot().robots.find((r) => r.id === "r1")!;
+
+      // Off-grid position -> quarantined, status forced to ERROR.
+      adapter.injectEvent({ type: "state", state: { ...initial, pos: { x: 99, y: 99 } } });
+      orch.tickOnce();
+      expect(orch.snapshot().robots.find((r) => r.id === "r1")?.status).toBe("ERROR");
+
+      // A later heartbeat, still off-grid, reporting the source system's own
+      // idea of status (IDLE) and a fresh battery reading — status must
+      // stay pinned to ERROR while quarantined; battery must still update.
+      adapter.injectEvent({
+        type: "state",
+        state: { ...initial, pos: { x: 99, y: 99 }, status: "IDLE", battery: 0.42 },
+      });
+      orch.tickOnce();
+      let rState = orch.snapshot().robots.find((r) => r.id === "r1");
+      expect(rState?.status).toBe("ERROR");
+      expect(rState?.battery).toBeCloseTo(0.42);
+
+      // Position recovers -> un-quarantined, status flips back off ERROR.
+      adapter.injectEvent({ type: "state", state: { ...initial, status: "IDLE" } });
+      orch.tickOnce();
+      rState = orch.snapshot().robots.find((r) => r.id === "r1");
+      expect(rState?.status).not.toBe("ERROR");
+    });
+  });
 });

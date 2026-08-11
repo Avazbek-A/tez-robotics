@@ -61,6 +61,14 @@ export interface OrchestratorOpts {
   watchdogTicks?: number;
   /** Injectable clock (ms epoch), for deterministic tests. Default Date.now. */
   now?: () => number;
+  /**
+   * Cap on how many TERMINAL orders (completed/failed/canceled) are kept in
+   * `allOrders` / returned by `snapshot()`. Every non-terminal order is
+   * always kept regardless of this cap. Once the terminal count exceeds
+   * this value, the OLDEST terminal orders are dropped (memory too, not
+   * just the snapshot view) — see `pruneTerminalOrders()`. Default 200.
+   */
+  terminalOrderRetention?: number;
 }
 
 interface RobotLeg {
@@ -259,6 +267,7 @@ export class Orchestrator {
       yieldAfterTicks: opts?.yieldAfterTicks ?? 6,
       yieldCooldownTicks: opts?.yieldCooldownTicks ?? 20,
       watchdogTicks: opts?.watchdogTicks ?? 40,
+      terminalOrderRetention: opts?.terminalOrderRetention ?? 200,
       now: opts?.now,
     };
     // Minor 6: config sanity alarms — surfaced (not thrown, not clamped: the
@@ -335,6 +344,98 @@ export class Orchestrator {
     const order = this.book.create(pickupNode, dropNode);
     this.allOrders.push(order);
     return order;
+  }
+
+  /**
+   * Plan2 #17: cancels an order — any non-terminal order transitions to
+   * `canceled` via `book.transition`. If a robot currently holds it (its
+   * `rt.leg` is still the ORDER leg for this order — the only case where
+   * there is anything of this order's to clean up on the robot side), this
+   * mirrors the exact shared recovery shape every other recovery path in
+   * this file uses (see `executeRecovery()`): best-effort
+   * `adapter.cancelMission`, `releaseAll` + synchronous own-cell re-claim,
+   * then `setLeg(rt, undefined)` so the robot re-enters the idle pool on the
+   * next tick's `runDispatch()`.
+   *
+   * Unlike `executeRecovery()`'s callers (which all run FROM WITHIN a tick,
+   * before `runDispatch`/`runRouting` for that same tick), this is a public
+   * API called from OUTSIDE the tick loop (e.g. an API request handler) —
+   * so the own-cell re-claim here isn't strictly load-bearing for THIS
+   * tick's ordering invariant (there is no "this tick" in progress), but is
+   * still performed for safety/symmetry with every other release path, and
+   * because the very next tick's `resolveCurrentNodes()` will heal it
+   * regardless.
+   *
+   * @throws Error("order not found: ...") if `orderId` is unknown.
+   * @throws Error("order already terminal: ...") if the order is already
+   *   completed, failed, or canceled.
+   */
+  cancelOrder(orderId: string): TransportOrder {
+    const order = this.allOrders.find((o) => o.id === orderId);
+    if (!order) {
+      throw new Error(`order not found: ${orderId}`);
+    }
+    if (order.status === "completed" || order.status === "failed" || order.status === "canceled") {
+      throw new Error(`order already terminal: ${orderId}`);
+    }
+
+    const holderId = order.robotId;
+    if (holderId !== undefined) {
+      const rt = this.robots.get(holderId);
+      if (rt && rt.leg && rt.leg.kind === "order" && rt.leg.orderId === orderId) {
+        void this.adapter.cancelMission(holderId).catch(() => {
+          /* best-effort; robot may be unreachable */
+        });
+        this.reservations.releaseAll(holderId);
+        if (rt.currentNodeId !== undefined) {
+          this.reservations.claim(holderId, [cellKey(this.map.node(rt.currentNodeId).pos)]);
+        }
+        setLeg(rt, undefined);
+      }
+    }
+
+    const canceled = this.book.transition(orderId, "canceled", "canceled via cancelOrder");
+    this.pruneTerminalOrders();
+    return canceled;
+  }
+
+  /**
+   * Spec decision 1 (Plan2 #18, WS frame growth): after any transition that
+   * may have moved an order into a terminal status (completed/failed/
+   * canceled), drop the OLDEST terminal orders from `allOrders` — memory
+   * too, not just `snapshot()`'s view — once the terminal count exceeds
+   * `opts.terminalOrderRetention`. Non-terminal orders are never touched,
+   * regardless of retention. `allOrders` is append-ordered by creation
+   * (see `submitOrder()`), so scanning it front-to-back and removing
+   * terminal entries first is exactly "oldest-terminal-first", and the
+   * remaining entries stay in stable, newest-last order — `snapshot()`
+   * needs no extra filtering, it just spreads `allOrders` as-is.
+   *
+   * KPIs (`completions`, `cycleTimes`) are tracked independently of
+   * `allOrders` and are unaffected by this pruning.
+   *
+   * Cheap and idempotent to call after every transition/requeue call site
+   * in this file, including ones that turned out NOT to produce a terminal
+   * order (a no-op in that case) — see this file's call sites of
+   * `book.transition`/`book.requeue`.
+   */
+  private pruneTerminalOrders(): void {
+    const isTerminal = (o: TransportOrder): boolean =>
+      o.status === "completed" || o.status === "failed" || o.status === "canceled";
+    let terminalCount = 0;
+    for (const o of this.allOrders) {
+      if (isTerminal(o)) terminalCount++;
+    }
+    let excess = terminalCount - this.opts.terminalOrderRetention;
+    if (excess <= 0) return;
+    for (let i = 0; i < this.allOrders.length && excess > 0; ) {
+      if (isTerminal(this.allOrders[i]!)) {
+        this.allOrders.splice(i, 1);
+        excess--;
+      } else {
+        i++;
+      }
+    }
   }
 
   snapshot(): {
@@ -437,7 +538,20 @@ export class Orchestrator {
       case "state": {
         let rt = this.robots.get(e.state.id);
         if (rt) {
+          // Spec decision 5b (#10 smalls): while quarantined, this robot's
+          // status was forced to "ERROR" by resolveCurrentNodes() — the
+          // orchestrator's own authoritative signal that its position is
+          // unresolvable — and must stay pinned there regardless of what
+          // the source system's own state event claims (typically its
+          // pre-quarantine status, since a real adapter has no concept of
+          // "quarantined"). Position/battery/etc. still flow through
+          // normally via the wholesale `rt.state = e.state` assignment;
+          // only `status` is overridden back, immediately after. Un-pinning
+          // happens exactly once, in resolveCurrentNodes(), the instant the
+          // robot's position resolves again.
+          const wasQuarantined = rt.quarantined;
           rt.state = e.state;
+          if (wasQuarantined) rt.state.status = "ERROR";
         } else {
           rt = {
             state: e.state,
@@ -751,6 +865,7 @@ export class Orchestrator {
         } catch {
           /* already terminal */
         }
+        this.pruneTerminalOrders();
         this.reservations.releaseAll(robotId);
         setLeg(rt, undefined);
         return;
@@ -782,6 +897,7 @@ export class Orchestrator {
       } catch {
         return;
       }
+      this.pruneTerminalOrders();
       const cycleMs = this.nowMs() - Date.parse(order.createdAt);
       this.cycleTimes.push(cycleMs);
       this.completions++;
@@ -838,6 +954,7 @@ export class Orchestrator {
     } catch {
       // already terminal / stale — nothing to do
     }
+    this.pruneTerminalOrders();
     this.reservations.releaseAll(robotId);
     setLeg(rt, undefined);
     this.pushAlarm(`t=${this.tickCount} mission failed for robot ${robotId}: ${reason}`);
@@ -884,6 +1001,7 @@ export class Orchestrator {
             } catch {
               /* already terminal */
             }
+            this.pruneTerminalOrders();
           }
           this.reservations.releaseAll(id);
           setLeg(rt, undefined);
@@ -961,6 +1079,7 @@ export class Orchestrator {
         } catch {
           /* already terminal */
         }
+        this.pruneTerminalOrders();
       }
       this.reservations.releaseAll(id);
       // Re-claim the robot's own physically-occupied cell immediately —
@@ -1021,7 +1140,17 @@ export class Orchestrator {
       // still before re-earning dispatch eligibility.
       const cooling =
         rt.dispatchCooldownUntilTick !== undefined && this.tickCount < rt.dispatchCooldownUntilTick;
-      const isFreeIdle = !rt.leg && !badStatus && !cooling && !this.book.byRobot(asCoreRobotId(id));
+      // Spec decision 5a (#10 smalls): a robot reported offline but still
+      // within its offlineGraceMs grace window is neither quarantined nor
+      // bad-status (its last-known RobotState.status is whatever it was
+      // before it dropped, typically still IDLE/EXECUTING) — without this
+      // gate it would be dispatched a fresh order it cannot possibly
+      // execute, burning that order's limited retry budget for nothing
+      // while handleOfflineTimeouts() is the sole path actually responsible
+      // for recovering (requeueing) an offline robot's work, only once
+      // offlineGraceMs elapses.
+      const isFreeIdle =
+        !rt.leg && rt.online && !badStatus && !cooling && !this.book.byRobot(asCoreRobotId(id));
       if (!isFreeIdle) {
         rt.idleSinceTick = undefined;
         continue;
@@ -1432,6 +1561,7 @@ export class Orchestrator {
       } catch {
         /* already terminal */
       }
+      this.pruneTerminalOrders();
     }
     void this.adapter.cancelMission(id).catch(() => {
       /* best-effort */
