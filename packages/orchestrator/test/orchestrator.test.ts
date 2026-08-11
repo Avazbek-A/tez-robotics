@@ -1750,4 +1750,169 @@ describe("Orchestrator", () => {
       expect(completed).toBe(true);
     });
   });
+
+  describe("off-window reconciliation (#14)", () => {
+    it("a robot reported off its committed path gets its order requeued and cell re-claimed", () => {
+      // Drive r1 partway down a leg, then inject two consecutive state
+      // events snapping it to a node NOT on its committed window (grid(4,4),
+      // teleport to the far corner). Expect: "off committed path" alarm,
+      // order requeued (retries incremented, order back to queued), robot's
+      // holds released, its ACTUAL current cell re-claimed (via
+      // _reservationOwner).
+      const map = grid(4);
+      const adapter = new ScriptableAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      const orch = new Orchestrator(map, adapter, {});
+      adapter.tick();
+      orch.tickOnce();
+      const order = orch.submitOrder("n3_0", "n0_3");
+
+      // Drive a couple of real ticks so the pick leg has committed some path
+      // and genuinely progressed partway (not yet at the pickup).
+      step(orch, adapter);
+      step(orch, adapter);
+      const dispatchedBefore = orch.snapshot().orders.find((o) => o.id === order.id);
+      expect(dispatchedBefore?.status).toBe("dispatched");
+      const beforeDrift = orch.snapshot().robots.find((r) => r.id === "r1")!;
+
+      // Two consecutive off-window snaps to the far corner (n3_3) — nowhere
+      // on the committed path toward n3_0.
+      adapter.injectEvent({
+        type: "state",
+        state: { ...beforeDrift, pos: map.node("n3_3").pos },
+      });
+      orch.tickOnce();
+      expect(
+        orch.getAlarms().some((a) => a.includes("off committed path"))
+      ).toBe(false); // single stale snap must not trip it yet
+
+      adapter.injectEvent({
+        type: "state",
+        state: { ...beforeDrift, pos: map.node("n3_3").pos },
+      });
+      orch.tickOnce();
+
+      expect(
+        orch.getAlarms().some((a) => a.includes("off committed path") && a.includes("r1"))
+      ).toBe(true);
+
+      const afterOrder = orch.snapshot().orders.find((o) => o.id === order.id)!;
+      expect(afterOrder.status).toBe("queued");
+      expect(afterOrder.retries).toBeGreaterThanOrEqual(1);
+
+      const r1After = orch.snapshot().robots.find((r) => r.id === "r1")!;
+      expect(r1After.pos).toEqual(map.node("n3_3").pos);
+      expect(orch._reservationOwner(cellKey(r1After.pos))).toBe("r1");
+    });
+
+    it("a single-tick stale snap does NOT trigger recovery", () => {
+      // One off-window state event followed by an on-window one: no alarm,
+      // leg intact, order completes normally.
+      const map = grid(4);
+      const adapter = new ScriptableAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      const orch = new Orchestrator(map, adapter, {});
+      adapter.tick();
+      orch.tickOnce();
+      const order = orch.submitOrder("n2_0", "n0_2");
+
+      step(orch, adapter);
+      const r1 = orch.snapshot().robots.find((r) => r.id === "r1")!;
+
+      // One off-window snap...
+      adapter.injectEvent({
+        type: "state",
+        state: { ...r1, pos: map.node("n3_3").pos },
+      });
+      orch.tickOnce();
+      expect(orch.getAlarms().some((a) => a.includes("off committed path"))).toBe(false);
+
+      // ...followed by an on-window one (revert to the real current node) —
+      // the transient snap tolerance must reset, not accumulate.
+      adapter.injectEvent({
+        type: "state",
+        state: { ...r1, pos: r1.pos },
+      });
+      orch.tickOnce();
+      expect(orch.getAlarms().some((a) => a.includes("off committed path"))).toBe(false);
+
+      let completed = false;
+      for (let i = 0; i < 60 && !completed; i++) {
+        step(orch, adapter);
+        completed = orch.snapshot().orders.find((o) => o.id === order.id)?.status === "completed";
+      }
+      expect(completed).toBe(true);
+      expect(orch.getAlarms().some((a) => a.includes("off committed path"))).toBe(false);
+    });
+  });
+
+  describe("physical-progress watchdog (#15)", () => {
+    it("a connected robot that stops moving on a fully-extended path is recovered", () => {
+      // 1 robot, order with a short leg so frontier reaches goal quickly
+      // (pickup = robot's own current cell, so the pick leg's frontier
+      // equals its goal from the moment it's created — extension is never
+      // even attempted, so the deadlock backstop's blockedTicks counter
+      // never moves off 0). Then never call adapter.tick() again (robot
+      // frozen, still online, no state/progress events at all) while
+      // ticking the orchestrator watchdogTicks+2 times. blockedTicksLimit is
+      // set far away so the watchdog is unambiguously what fires.
+      const map = grid(3);
+      const adapter = new ScriptableAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      const orch = new Orchestrator(map, adapter, { watchdogTicks: 8, blockedTicksLimit: 30 });
+      adapter.tick();
+      orch.tickOnce();
+      const order = orch.submitOrder("n0_0", "n2_2");
+      orch.tickOnce(); // dispatch: pick leg created (frontier === goal already), sent once
+
+      const dispatched = orch.snapshot().orders.find((o) => o.id === order.id);
+      expect(dispatched?.status).toBe("dispatched");
+
+      // Freeze: no more adapter.tick() calls at all for the rest of this
+      // test — the robot never physically moves again. Stop as soon as the
+      // watchdog fires (well within watchdogTicks+2 iterations) rather than
+      // over-driving: r1 is idle again immediately after recovery, so
+      // continuing to tick past that point would let runDispatch()
+      // legitimately re-assign the very same (now re-queued) order right
+      // back to it, which would itself go on to re-trip its OWN fresh
+      // watchdog clock later — a correct but irrelevant second event this
+      // test isn't about.
+      let watchdogFired = false;
+      for (let i = 0; i < 10 && !watchdogFired; i++) {
+        orch.tickOnce();
+        watchdogFired = orch
+          .getAlarms()
+          .some((a) => a.includes("no physical progress") && a.includes("r1"));
+      }
+
+      expect(watchdogFired).toBe(true);
+      expect(orch.getAlarms().some((a) => a.includes("— requeueing order"))).toBe(false);
+
+      const after = orch.snapshot().orders.find((o) => o.id === order.id)!;
+      expect(after.status).toBe("queued");
+      expect(after.retries).toBeGreaterThanOrEqual(1);
+
+      expect(adapter.cancelCalls).toContain("r1");
+      const r1 = orch.snapshot().robots.find((r) => r.id === "r1")!;
+      expect(r1.status).toBe("IDLE");
+      expect(orch._reservationOwner(cellKey(r1.pos))).toBe("r1");
+    });
+
+    it("normal slow progress does not trip the watchdog", () => {
+      // adapter.tick() every 3rd orchestrator tick, watchdogTicks 8: order
+      // completes, no watchdog alarm (each progress event resets the clock).
+      const map = grid(4);
+      const adapter = new FakeAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      const orch = new Orchestrator(map, adapter, { watchdogTicks: 8 });
+      adapter.tick();
+      orch.tickOnce();
+      const order = orch.submitOrder("n0_3", "n3_0");
+
+      let completed = false;
+      for (let i = 0; i < 200 && !completed; i++) {
+        if (i % 3 === 0) adapter.tick();
+        orch.tickOnce();
+        completed = orch.snapshot().orders.find((o) => o.id === order.id)?.status === "completed";
+      }
+      expect(completed).toBe(true);
+      expect(orch.getAlarms().some((a) => a.includes("no physical progress"))).toBe(false);
+    });
+  });
 });

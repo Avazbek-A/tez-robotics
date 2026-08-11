@@ -41,6 +41,13 @@ export interface OrchestratorOpts {
    * yielded robot is not ping-ponged. Default 20.
    */
   yieldCooldownTicks?: number;
+  /**
+   * Ticks without physical progress (progressIndex advance) after which a
+   * legged robot's mission is presumed stuck and recovered; must exceed
+   * blockedTicksLimit so the contention backstop wins where both apply.
+   * Default 40.
+   */
+  watchdogTicks?: number;
   /** Injectable clock (ms epoch), for deterministic tests. Default Date.now. */
   now?: () => number;
 }
@@ -57,6 +64,21 @@ interface RobotLeg {
   progressIndex: number;
   /** Consecutive routing ticks the leg was extension-blocked by a failed claim. */
   blockedTicks: number;
+  /**
+   * Consecutive routing ticks the robot's reported node was NOT found
+   * anywhere in its committed window (nodeIds.slice(progressIndex)) —
+   * physical drift off the committed path (#14). Reset to 0 whenever back
+   * on-window.
+   */
+  offWindowTicks: number;
+  /**
+   * tickCount at leg creation, and refreshed whenever progressIndex
+   * genuinely advances (or a handleMissionDone resume reseeds the leg — a
+   * resume IS progress). Used by the physical-progress watchdog (#15) to
+   * detect a connected-but-stalled robot that neither blocked-branch
+   * counter can see.
+   */
+  lastProgressTick: number;
 }
 
 interface RobotRuntime {
@@ -196,6 +218,7 @@ export class Orchestrator {
       blockedTicksLimit: opts?.blockedTicksLimit ?? 20,
       yieldAfterTicks: opts?.yieldAfterTicks ?? 6,
       yieldCooldownTicks: opts?.yieldCooldownTicks ?? 20,
+      watchdogTicks: opts?.watchdogTicks ?? 40,
       now: opts?.now,
     };
     this.router = new PibtRouter(map);
@@ -586,6 +609,15 @@ export class Orchestrator {
           );
           currentLeg.nodeIds = [frontierNode!];
           currentLeg.progressIndex = 0;
+          // A resume IS progress: the robot has just confirmed reaching its
+          // committed frontier, so both the off-window transient-snap
+          // counter and the physical-progress watchdog clock must reset
+          // here exactly like the ordinary progress-scan path does, or a
+          // robot legitimately pacing out repeated horizon/contention-paused
+          // resumes would eventually trip the watchdog despite genuinely
+          // making progress every time.
+          currentLeg.offWindowTicks = 0;
+          currentLeg.lastProgressTick = this.tickCount;
           // Deliberately NOT resetting blockedTicks here: doing so proved to
           // be its own deadlock — a robot with NO viable further extension
           // (e.g. genuinely, permanently blocked by another parked robot)
@@ -644,6 +676,8 @@ export class Orchestrator {
         sent: false,
         progressIndex: 0,
         blockedTicks: 0,
+        offWindowTicks: 0,
+        lastProgressTick: this.tickCount,
       });
     } else {
       try {
@@ -901,6 +935,8 @@ export class Orchestrator {
         sent: false,
         progressIndex: 0,
         blockedTicks: 0,
+        offWindowTicks: 0,
+        lastProgressTick: this.tickCount,
       });
     }
   }
@@ -963,9 +999,41 @@ export class Orchestrator {
           if (j > leg.progressIndex) {
             leg.progressIndex = j;
             leg.blockedTicks = 0; // physical progress = not deadlocked
+            leg.lastProgressTick = this.tickCount; // #15: progress resets the watchdog clock
+            leg.offWindowTicks = 0;
           }
           break;
         }
+      }
+
+      // #14: robot's reported node is nowhere on its committed window —
+      // physical drift (avoidance swerve, teleop, bump). Two consecutive
+      // ticks required: a single stale positional snap is routine (see
+      // lastVdaNodeId doc) and must not kill a healthy leg.
+      const windowNodes = leg.nodeIds.slice(leg.progressIndex);
+      if (!windowNodes.includes(rt.currentNodeId)) {
+        leg.offWindowTicks++;
+        if (leg.offWindowTicks >= 2) {
+          this.recoverLeg(id, rt, leg, `off committed path at ${rt.currentNodeId}`);
+          continue;
+        }
+      } else {
+        leg.offWindowTicks = 0;
+      }
+
+      // #15: no physical progress for watchdogTicks — stuck-but-connected
+      // robot (fully-extended frontier, or lag-capped stall) that neither
+      // blocked-branch counter can see. watchdogTicks (default 40) is set
+      // greater than blockedTicksLimit (default 20) specifically so that,
+      // whenever BOTH could apply (extension genuinely blocked), the
+      // contention backstop above (or a successful extension) always wins
+      // first — this only ever fires for the cases where extension is NOT
+      // blocked at all: frontier already at goal (no extension attempted,
+      // so blockedTicks never moves off 0), or claims keep succeeding but
+      // the robot itself never physically moves.
+      if (this.tickCount - leg.lastProgressTick >= this.opts.watchdogTicks) {
+        this.recoverLeg(id, rt, leg, "no physical progress (watchdog)");
+        continue;
       }
 
       const frontierIndex = leg.nodeIds.length - 1;
@@ -1070,39 +1138,78 @@ export class Orchestrator {
    * Deadlock backstop recovery: cancel the robot's mission, requeue its
    * order (OrderBook's 3-retry cap then fails it outright rather than
    * hanging forever), release all of the robot's reservation holds, and
-   * clear its leg — the same recovery shape as handleMissionFailed().
-   *
-   * Critical fix: release + re-claim must happen together, synchronously,
-   * right here. releaseAll() alone would leave the robot's own
-   * physically-occupied cell unowned for the REMAINDER of this tick's
-   * runRouting() loop (resolveCurrentNodes() — which is what normally
-   * claims an idle robot's current cell — already ran earlier this same
-   * tick), making it claimable by any OTHER robot processed later in this
-   * same loop. Worse, on the VERY NEXT tick, resolveCurrentNodes()'s idle
-   * re-claim for THIS robot would then see the cell as foreign-owned and
-   * get an empty grant (claim() is a no-op on empty grant), so the robot
-   * would never recover ownership of the cell it is still physically
-   * sitting on — a genuine collision hole.
+   * clear its leg — the same recovery shape as handleMissionFailed(). The
+   * actual mechanics (including the critical release+re-claim ordering fix)
+   * live in executeRecovery() below; this method owns only the
+   * backstop-specific alarm text.
    */
   private requeueBlockedLeg(id: RobotId, rt: RobotRuntime, leg: RobotLeg, deniedCell: CellKey): void {
     // #13: a blocked YIELD leg has no order to requeue — it was never in
     // the order book to begin with (see tryDispatchYield). Log distinctly
     // ("abandoning yield" vs "requeueing order") so alarm text never
     // implies an order was affected when none was; cancel/releaseAll/
-    // own-cell re-claim/clear stay identical for both leg kinds.
+    // own-cell re-claim/clear stay identical for both leg kinds — that
+    // shared mechanics is factored into executeRecovery() below (also used
+    // by recoverLeg(), the #14/#15 recovery entry point), so it exists
+    // exactly ONCE in this file.
     if (leg.kind === "order") {
       this.alarms.push(
         `t=${this.tickCount} robot ${id} blocked ${leg.blockedTicks} ticks at ${deniedCell} — requeueing order ${leg.orderId}`
       );
-      try {
-        this.book.requeue(leg.orderId, "sustained reservation contention");
-      } catch {
-        /* already terminal */
-      }
     } else {
       this.alarms.push(
         `t=${this.tickCount} robot ${id} blocked ${leg.blockedTicks} ticks at ${deniedCell} — abandoning yield`
       );
+    }
+    this.executeRecovery(id, rt, leg, "sustained reservation contention");
+  }
+
+  /**
+   * #14/#15 recovery entry point: physical off-window drift and the
+   * physical-progress watchdog both funnel through here. Pushes the alarm
+   * in the shape specified by the design (`t=<n> robot <id> <reason> —
+   * recovering (order requeued|yield abandoned)`), then defers to the same
+   * executeRecovery() mechanics the deadlock backstop
+   * (requeueBlockedLeg()) uses — see that method's doc comment for why the
+   * cancel/conditional-requeue/releaseAll/own-cell-re-claim/clear sequence
+   * must exist in exactly one place.
+   */
+  private recoverLeg(id: RobotId, rt: RobotRuntime, leg: RobotLeg, reason: string): void {
+    this.alarms.push(
+      `t=${this.tickCount} robot ${id} ${reason} — recovering ` +
+        `(${leg.kind === "order" ? "order requeued" : "yield abandoned"})`
+    );
+    this.executeRecovery(id, rt, leg, reason);
+  }
+
+  /**
+   * Shared recovery mechanics — the ONE place in this file the sequence
+   * (conditional order requeue, best-effort mission cancel, release all
+   * reservation holds, synchronously re-claim the robot's own
+   * physically-occupied cell, clear the leg) is implemented. Callers own
+   * their own alarm text (the deadlock backstop's and #14/#15's alarm
+   * shapes differ) and call this afterward for the actual recovery.
+   *
+   * Critical fix (carried over from the pre-refactor requeueBlockedLeg):
+   * release + re-claim must happen together, synchronously, right here.
+   * releaseAll() alone would leave the robot's own physically-occupied cell
+   * unowned for the REMAINDER of this tick's runRouting() loop
+   * (resolveCurrentNodes() — which is what normally claims an idle robot's
+   * current cell — already ran earlier this same tick), making it
+   * claimable by any OTHER robot processed later in this same loop. Worse,
+   * on the VERY NEXT tick, resolveCurrentNodes()'s idle re-claim for THIS
+   * robot would then see the cell as foreign-owned and get an empty grant
+   * (claim() is a no-op on empty grant), so the robot would never recover
+   * ownership of the cell it is still physically sitting on — a genuine
+   * collision hole.
+   */
+  private executeRecovery(id: RobotId, rt: RobotRuntime, leg: RobotLeg, reason: string): void {
+    if (leg.kind === "order") {
+      try {
+        this.book.requeue(leg.orderId, reason);
+      } catch {
+        /* already terminal */
+      }
     }
     void this.adapter.cancelMission(id).catch(() => {
       /* best-effort */
@@ -1161,6 +1268,8 @@ export class Orchestrator {
         sent: false,
         progressIndex: 0,
         blockedTicks: 0,
+        offWindowTicks: 0,
+        lastProgressTick: this.tickCount,
       });
       this.alarms.push(
         `t=${this.tickCount} yield: robot ${ownerId} at ${nodeId} asked to vacate to ${target} (blocking ${blockedId})`
