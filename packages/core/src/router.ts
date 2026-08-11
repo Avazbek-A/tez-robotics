@@ -99,6 +99,19 @@ export class PibtRouter {
         const da = this.map.distance(a, agent.goal);
         const db = this.map.distance(b, agent.goal);
         if (da !== db) return da - db;
+        // Tie-break 2: prefer cells not currently occupied by another agent.
+        // Without this, an agent walking toward a distance-tied pair
+        // {occupied cell, free cell} always picks the lexicographically
+        // smaller one — which in boundary corridors is systematically the
+        // occupied one, shoving an at-goal peer off its goal and producing
+        // a deterministic livelock (two opposite-goal agents in one column
+        // mirror each other forever). Preferring the free cell routes the
+        // traveler around a parked agent whenever an equal-cost detour
+        // exists, while full-occupancy scenarios (rotations, saturation)
+        // are unaffected because then every candidate carries the penalty.
+        const oa = occupied.has(a) && occupied.get(a) !== agentId ? 1 : 0;
+        const ob = occupied.has(b) && occupied.get(b) !== agentId ? 1 : 0;
+        if (oa !== ob) return oa - ob;
         return a < b ? -1 : a > b ? 1 : 0;
       });
 

@@ -315,3 +315,51 @@ describe("PibtRouter", () => {
     expect(avgMs).toBeLessThan(100);
   });
 });
+
+describe("boundary-corridor livelock regression (P1)", () => {
+  function runUntilAllGoals(
+    mapData: ReturnType<typeof WarehouseMap.grid>,
+    starts: Array<[string, string]>,
+    goals: Array<[string, string]>,
+    maxSteps: number
+  ): number {
+    const map = WarehouseMap.fromJSON(mapData);
+    const router = new PibtRouter(map);
+    const pos = new Map(starts);
+    const goal = new Map(goals);
+    for (let t = 0; t < maxSteps; t++) {
+      const agents: Agent[] = [...pos.entries()].map(([id, at]) => ({
+        id: id as RobotId,
+        at,
+        goal: goal.get(id)!,
+        priority: 0,
+      }));
+      const moves = router.step(agents);
+      for (const [id, next] of moves) pos.set(id as string, next);
+      if ([...goal.entries()].every(([id, g]) => pos.get(id) === g)) return t;
+    }
+    return -1;
+  }
+
+  it("two agents with opposite goals in the x=0 column of a 5x5 grid both reach their goals", () => {
+    const reachedAt = runUntilAllGoals(
+      WarehouseMap.grid(5, 5),
+      [["r2", "n0_2"], ["r3", "n0_3"]],
+      [["r2", "n0_4"], ["r3", "n0_0"]],
+      40
+    );
+    expect(reachedAt).toBeGreaterThanOrEqual(0);
+    expect(reachedAt).toBeLessThanOrEqual(30);
+  });
+
+  it("two agents swapping opposite ends of an 8x2 grid both reach their goals", () => {
+    const reachedAt = runUntilAllGoals(
+      WarehouseMap.grid(8, 2),
+      [["a", "n0_0"], ["b", "n7_0"]],
+      [["a", "n7_0"], ["b", "n0_0"]],
+      60
+    );
+    expect(reachedAt).toBeGreaterThanOrEqual(0);
+    expect(reachedAt).toBeLessThanOrEqual(40);
+  });
+});
