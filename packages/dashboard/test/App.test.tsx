@@ -30,7 +30,11 @@ describe("App language switching (render-based)", () => {
     expect(document.body.textContent).toContain("Cockpit");
     expect(document.body.textContent).not.toContain("Кокпит");
 
-    // Connection chip (ConnectionChip) must reflect the new lang too.
-    expect(document.body.textContent).toContain("Connection: reconnecting");
+    // Connection chip (ConnectionChip) must reflect the new lang too. Real
+    // connection state now drives this (Task 12 wires the WS client in),
+    // rather than the old hardcoded "reconnecting" placeholder; happy-dom
+    // has no WebSocket implementation, so App's WS-wiring effect is a
+    // no-op here and the store stays at its default "connecting" state.
+    expect(document.body.textContent).toContain("Connection: connecting");
   });
 });
