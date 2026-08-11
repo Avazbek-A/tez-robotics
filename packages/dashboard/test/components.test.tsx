@@ -139,4 +139,26 @@ describe("AlarmDrawer", () => {
     fireEvent.click(screen.getByRole("button", { name: /alarms/i }));
     expect(screen.getByText("No alarms")).toBeInTheDocument();
   });
+
+  it("counts only real faults on the red badge; contention goes to the traffic section", () => {
+    render(
+      <AlarmDrawer
+        alarms={[
+          "robot r1 offline — order requeued",
+          "t=5 contention: robot r2 could not claim 3:4 (owner=r1)",
+          "t=6 contention: robot r3 could not claim 3:5 (owner=r2)",
+        ]}
+      />,
+    );
+    // badge: 1 fault + separate neutral counter for 2 traffic events
+    expect(screen.getByText("1")).toBeInTheDocument();
+    expect(screen.getByText("2")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /alarms/i }));
+    expect(screen.getByText("Traffic coordination", { exact: false })).toBeInTheDocument();
+    expect(screen.getByText(/robot r1 offline/)).toBeInTheDocument();
+    const items = screen.getAllByRole("listitem");
+    expect(items).toHaveLength(3); // 1 fault + 2 traffic, newest-first within each section
+    expect(items[1].textContent).toContain("t=6");
+    expect(items[2].textContent).toContain("t=5");
+  });
 });
