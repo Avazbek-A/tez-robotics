@@ -411,6 +411,99 @@ describe("Orchestrator", () => {
       const order2State = orchestrator.snapshot().orders.find((o) => o.id === order2.id);
       expect(["r1", "r2"]).toContain(order2State?.robotId);
     });
+
+    it("C1 re-pin: r1 is not permanently excluded from dispatch — a follow-up order goes to r1 while r2 is provably busy on order 1", () => {
+      // The test above was deliberately diluted to accept either robot
+      // completing order 1, because Task 2's reservation-blocking fix can
+      // legitimately hand order 1 back to either r1 or r2 depending on
+      // timing. That's correct for order 1, but it stopped pinning the
+      // ORIGINAL C1 guarantee this suite existed to prove: that a robot
+      // whose stale missionDone was correctly ignored (order-book
+      // bookkeeping untouched) is NOT left permanently wedged out of future
+      // dispatch. This test restores that guarantee deterministically by
+      // making r2 provably busy (a live leg on order 1) at the moment a
+      // SECOND order is submitted — runDispatch()'s `isFreeIdle` gate
+      // (!rt.leg && !badStatus && !book.byRobot(id)) then excludes r2 as a
+      // candidate entirely, so r1 is the ONLY eligible robot regardless of
+      // Hungarian distance weighting.
+      const map = grid(5);
+      const adapter = new UncancellableFakeAdapter(
+        [
+          { id: "r1", startNodeId: "n0_0" },
+          { id: "r2", startNodeId: "n4_4" },
+        ],
+        map
+      );
+      const clock = fakeClock();
+      const orchestrator = new Orchestrator(map, adapter, {
+        now: clock.now,
+        offlineGraceMs: 5_000,
+      });
+
+      const order1 = orchestrator.submitOrder("n2_0", "n4_4");
+
+      // r1 (closer) wins the dispatch and starts moving.
+      step(orchestrator, adapter);
+      step(orchestrator, adapter);
+      expect(orchestrator.snapshot().orders.find((o) => o.id === order1.id)?.robotId).toBe("r1");
+
+      // Knock r1 offline mid-pick, then let the grace period expire — order
+      // 1 requeues and r2 (idle) inherits it, same as the stale-report test
+      // above.
+      adapter.setConnection("r1", false);
+      orchestrator.tickOnce();
+      clock.advance(6_000);
+      orchestrator.tickOnce();
+
+      const afterGrace = orchestrator.snapshot().orders.find((o) => o.id === order1.id);
+      expect(afterGrace?.robotId).toBe("r2");
+      expect(["dispatched", "underway"]).toContain(afterGrace?.status);
+
+      // Revive r1. Its own FakeAdapter mission was never actually cancelled
+      // (cancelMission rejects), so it will eventually fire a stale
+      // missionDone that the C1 guard must ignore — exactly like the test
+      // above. Drive that stale report to completion so this test exercises
+      // the SAME mechanism, not a shortcut around it.
+      adapter.setConnection("r1", true);
+      orchestrator.tickOnce();
+
+      let staleReportSeen = false;
+      for (let i = 0; i < 10 && !staleReportSeen; i++) {
+        step(orchestrator, adapter);
+        staleReportSeen = orchestrator
+          .getAlarms()
+          .some((a) => a.includes("stale missionDone") && a.includes("r1"));
+      }
+      expect(staleReportSeen).toBe(true);
+
+      // r2 is still the legitimate, live holder of order 1 (a real leg, not
+      // yet complete over this 5x5 map) — provably busy. r1 has no leg at
+      // all (cleared by the offline handoff) and the C1 guard above did not
+      // touch order-book state for it. Submit a follow-up order now: r2 is
+      // excluded by isFreeIdle, so r1 MUST be assigned regardless of
+      // distance.
+      const stillBusy = orchestrator.snapshot().orders.find((o) => o.id === order1.id);
+      expect(stillBusy?.robotId).toBe("r2");
+      expect(["dispatched", "underway"]).toContain(stillBusy?.status);
+
+      const order2 = orchestrator.submitOrder("n0_1", "n0_2");
+      let order2Dispatched = false;
+      for (let i = 0; i < 10 && !order2Dispatched; i++) {
+        step(orchestrator, adapter);
+        const status = orchestrator.snapshot().orders.find((o) => o.id === order2.id)?.status;
+        order2Dispatched = status === "dispatched" || status === "underway";
+      }
+      expect(order2Dispatched).toBe(true);
+      expect(orchestrator.snapshot().orders.find((o) => o.id === order2.id)?.robotId).toBe("r1");
+
+      let order2Completed = false;
+      for (let i = 0; i < 60 && !order2Completed; i++) {
+        step(orchestrator, adapter);
+        order2Completed = orchestrator.snapshot().orders.find((o) => o.id === order2.id)?.status === "completed";
+      }
+      expect(order2Completed).toBe(true);
+      expect(orchestrator.snapshot().orders.find((o) => o.id === order2.id)?.robotId).toBe("r1");
+    });
   });
 
   describe("requeue from underway (offline during the drop leg)", () => {
@@ -1157,6 +1250,18 @@ describe("Orchestrator", () => {
           expect(
             map.neighbors(m.nodeIds[i - 1]!).includes(m.nodeIds[i]!),
             `${m.robotId} ${m.id}: ${m.nodeIds[i - 1]} -> ${m.nodeIds[i]} not adjacent`
+          ).toBe(true);
+          // #9 permanent guard: no self-edge [A, A] (consecutive duplicate
+          // node) can ever be wire-emitted. runRouting()'s extension only
+          // appends `nextNode` when `nextNode !== frontierNode`, initial
+          // legs seed with a single node, resume seeds with a single node
+          // (the confirmed frontier) — so no code path can ever push a
+          // duplicate of the last element. Verified here against every
+          // mission actually sent to the adapter across a skewed-cadence,
+          // two-robot, two-order run.
+          expect(
+            m.nodeIds[i] !== m.nodeIds[i - 1],
+            `${m.robotId} ${m.id}: self-edge [${m.nodeIds[i - 1]}, ${m.nodeIds[i]}] at index ${i}`
           ).toBe(true);
         }
       }

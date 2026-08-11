@@ -12,6 +12,38 @@ interface FakeRobotState {
   };
 }
 
+/**
+ * In-memory, deterministic, tick-driven `RobotAdapter` used by tests only —
+ * never a real robot connection. It implements a STRONGER contract than
+ * `RobotAdapter.on()`'s documented real-adapter guarantee (see that JSDoc
+ * in adapter.ts), and tests that rely on the extra strength are exercising
+ * fake-only behavior, not something a real adapter (e.g. Vda5050Adapter, or
+ * a future seer-tcp adapter) is required to provide:
+ *
+ *   - Lockstep per-tick ordering: within a single `tick()` call, a robot's
+ *     `missionProgress`/`missionDone` event (if any) is emitted BEFORE that
+ *     robot's heartbeat `state` event, for every robot, every tick. Real
+ *     adapters make no such promise relative to their own event cadence.
+ *   - `missionDone` fires exactly on the tick after the robot's
+ *     `currentNodeIndex` walks off the end of `nodeIds` — i.e. an N-node
+ *     mission (indices 0..N-1) completes on the Nth call to `tick()` for
+ *     that robot. A real adapter's completion timing is protocol- and
+ *     vendor-specific.
+ *   - FAKE-ONLY new-mission position teleport: `sendMission()`'s "new
+ *     mission" branch (different mission id than the robot's current one)
+ *     sets `robot.state.pos` straight to the FIRST node of the sent path
+ *     immediately, without the robot walking there over successive
+ *     `tick()` calls. This exists purely so tests can seed/reseed a robot's
+ *     reported position deterministically (e.g. Orchestrator's frontier-
+ *     race resume path re-sends under the same missionId specifically to
+ *     land in the "extension" branch below and avoid this teleport). A real
+ *     robot cannot teleport; its position only ever advances by physically
+ *     traversing the path it was sent.
+ *
+ * Any test asserting on exact per-tick event ordering, missionDone timing,
+ * or an instantaneous post-sendMission position is implicitly asserting on
+ * FakeAdapter's behavior, not on `RobotAdapter`'s general contract.
+ */
 export class FakeAdapter implements RobotAdapter {
   private robotStates: Map<RobotId, FakeRobotState> = new Map();
   private handlers: Array<(e: AdapterEvent) => void> = [];
