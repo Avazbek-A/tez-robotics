@@ -29,6 +29,10 @@ describe("REST", () => {
   it("POST /orders rejects missing body field", async () => {
     const res = await app.inject({ method: "POST", url: "/orders", payload: { pickupNode: "n2_2" } });
     expect(res.statusCode).toBe(400);
+    const body = res.json();
+    expect(typeof body.error).toBe("string");
+    expect(body).not.toHaveProperty("statusCode");
+    expect(Object.keys(body)).toEqual(["error"]);
   });
   it("GET /orders lists", async () => {
     const res = await app.inject({ method: "GET", url: "/orders" });

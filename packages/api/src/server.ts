@@ -23,6 +23,21 @@ export async function buildServer(system: System, opts?: BuildServerOpts): Promi
 
   const app = Fastify();
 
+  // Normalize Typebox/AJV schema-validation failures (e.g. a missing
+  // required body field) to the same {error: string} shape every route's
+  // handler-thrown 400s already use (see routes/orders.ts's unknown-node
+  // 400) — Fastify's default validation-error body is
+  // {statusCode, code, error, message}, which doesn't match any declared
+  // response schema and would otherwise leak that shape to clients. Other
+  // (non-validation) errors fall through to Fastify's default handling.
+  app.setErrorHandler((err, _request, reply) => {
+    if (err.validation) {
+      reply.code(400).send({ error: err.message });
+      return;
+    }
+    reply.send(err);
+  });
+
   await app.register(ordersRoutes, { system });
   await app.register(robotsRoutes, { system });
   await app.register(healthRoutes, { system });

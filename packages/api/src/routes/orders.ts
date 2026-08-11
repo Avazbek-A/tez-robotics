@@ -6,13 +6,6 @@ export interface OrdersRouteOpts extends FastifyPluginOptions {
   system: System;
 }
 
-const HistoryEntrySchema = Type.Object({
-  at: Type.String(),
-  from: Type.String(),
-  to: Type.String(),
-  reason: Type.Optional(Type.String()),
-});
-
 const OrderStatusSchema = Type.Union([
   Type.Literal("queued"),
   Type.Literal("dispatched"),
@@ -21,6 +14,13 @@ const OrderStatusSchema = Type.Union([
   Type.Literal("failed"),
   Type.Literal("canceled"),
 ]);
+
+const HistoryEntrySchema = Type.Object({
+  at: Type.String(),
+  from: OrderStatusSchema,
+  to: OrderStatusSchema,
+  reason: Type.Optional(Type.String()),
+});
 
 export const TransportOrderSchema = Type.Object({
   id: Type.String(),
