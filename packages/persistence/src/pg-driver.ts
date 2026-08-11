@@ -6,6 +6,8 @@ export function createPgDriver(databaseUrl: string): SqlDriver {
 
   return {
     async query<T = Record<string, unknown>>(sql: string, params?: unknown[]) {
+      // pool.query's generic overloads require T extends QueryResultRow, which SqlDriver's
+      // unconstrained T can't satisfy — call untyped and cast the result to the caller's T instead.
       const result = await pool.query(sql, params as unknown[] | undefined);
       return { rows: result.rows as T[] };
     },

@@ -19,15 +19,21 @@ export async function migrate(driver: SqlDriver): Promise<string[]> {
       continue;
     }
 
-    await driver.query("begin");
-    try {
-      await driver.query(migration.sql);
-      await driver.query("insert into schema_migrations (id, applied_at) values ($1, now())", [migration.id]);
-      await driver.query("commit");
-    } catch (err) {
-      await driver.query("rollback");
-      throw err;
-    }
+    // begin/migration sql/record/commit are sent as ONE multi-statement call
+    // (params: undefined) so the whole migration rides a single connection —
+    // splitting this across multiple driver.query() calls is unsafe under a
+    // pooled driver (pg.Pool), since each call may be handed a different
+    // pooled connection, breaking the transaction or leaking an open one
+    // back into the pool. migration.id is an internal literal constant from
+    // MIGRATIONS (not user input), so inlining it into the SQL text below is
+    // safe.
+    const sql = `
+      begin;
+      ${migration.sql}
+      insert into schema_migrations (id, applied_at) values ('${migration.id}', now());
+      commit;
+    `;
+    await driver.query(sql);
 
     newlyApplied.push(migration.id);
   }
