@@ -113,8 +113,33 @@ interface RobotRuntime {
   lastVdaNodeId?: string;
   idleSinceTick?: number;
   leg?: RobotLeg;
-  /** Tick of this robot's most recent yield dispatch, for yieldCooldownTicks anti-thrash. */
+  /**
+   * Tick of this robot's most recent yield dispatch that actually committed
+   * physical movement (its leg's first successful extension past its
+   * single starting node — see runRouting()'s extension-success branch),
+   * for yieldCooldownTicks anti-thrash. Deliberately NOT set at yield
+   * dispatch time (tryDispatchYield()) itself: a yield leg that never gets
+   * a chance to extend before being iterated-order-evaporated (see the
+   * send-guard in runRouting()) must not burn the cooldown window on a
+   * no-op — the blocked episode should be free to retry sooner.
+   */
   lastYieldTick?: number;
+  /**
+   * Review round 3 (#13/#15 interaction): set ONLY by executeRecovery()'s
+   * watchdog path (never by contention-backstop or off-window recovery —
+   * those recover a healthy robot from unlucky circumstances, not a
+   * malfunctioning one) to `tickCount + opts.watchdogTicks` at the moment
+   * a stalled robot's leg is force-cleared. runDispatch() excludes the
+   * robot from the idle pool until this tick passes: without it, a robot
+   * whose watchdog just fired (still reporting healthy status, so nothing
+   * else excludes it) is instantly re-picked by Hungarian (often the
+   * CLOSEST candidate, being wherever it got stuck) for a fresh order that
+   * promptly restalls the same way — burning the order's 3-retry cap in
+   * roughly 3x watchdogTicks while other, genuinely healthy robots sit
+   * idle. The robot must prove it can hold still without re-stalling
+   * (silently, no leg to fail) before re-earning dispatch eligibility.
+   */
+  dispatchCooldownUntilTick?: number;
 }
 
 function asCoreRobotId(id: RobotId): CoreRobotId {
@@ -236,6 +261,26 @@ export class Orchestrator {
       watchdogTicks: opts?.watchdogTicks ?? 40,
       now: opts?.now,
     };
+    // Minor 6: config sanity alarms — surfaced (not thrown, not clamped: the
+    // caller may have deliberate reasons, e.g. a test isolating one
+    // mechanism from another) at construction time so a misconfiguration
+    // that silently disables a whole recovery mechanism is visible from
+    // tick 0 rather than only inferable from its absence during a soak.
+    if (this.opts.watchdogTicks <= this.opts.blockedTicksLimit) {
+      this.pushAlarm(
+        `t=0 config: watchdogTicks (${this.opts.watchdogTicks}) <= blockedTicksLimit ` +
+          `(${this.opts.blockedTicksLimit}) — the physical-progress watchdog (#15) may fire ` +
+          `before the contention backstop gets a chance to resolve a genuinely-blocked (not ` +
+          `just stalled) leg; see watchdogTicks' doc comment`
+      );
+    }
+    if (this.opts.yieldAfterTicks >= this.opts.blockedTicksLimit) {
+      this.pushAlarm(
+        `t=0 config: yieldAfterTicks (${this.opts.yieldAfterTicks}) >= blockedTicksLimit ` +
+          `(${this.opts.blockedTicksLimit}) — yield dispatch (#13) is effectively disabled, the ` +
+          `deadlock backstop always fires first; see yieldAfterTicks' doc comment`
+      );
+    }
     this.router = new PibtRouter(map);
     this.reservations = new ReservationTable();
     this.book = new OrderBook(() => new Date(this.nowMs()).toISOString());
@@ -902,6 +947,13 @@ export class Orchestrator {
 
       rt.offlineHandled = true;
       rt.state.status = "UNKNOWN";
+      // Minor 4: capture what's ACTUALLY about to happen to this robot's
+      // leg before it's cleared below, so the closing alarm reports truth
+      // instead of unconditionally claiming "order requeued" — a robot that
+      // went offline mid-YIELD has no order to requeue at all (yield legs
+      // never touch the book, same as everywhere else in this file), and a
+      // robot that was simply idle when it dropped offline has neither.
+      const hadYieldLeg = rt.leg?.kind === "yield";
       const order = this.book.byRobot(asCoreRobotId(id));
       if (order) {
         try {
@@ -934,9 +986,8 @@ export class Orchestrator {
       void this.adapter.cancelMission(id).catch(() => {
         /* best-effort; robot is unreachable anyway */
       });
-      this.pushAlarm(
-        `t=${this.tickCount} robot ${id} offline > ${grace}ms — order requeued, mission cancelled`
-      );
+      const outcome = order ? "order requeued" : hadYieldLeg ? "yield abandoned" : "no active work";
+      this.pushAlarm(`t=${this.tickCount} robot ${id} offline > ${grace}ms — ${outcome}, mission cancelled`);
     }
   }
 
@@ -954,7 +1005,23 @@ export class Orchestrator {
       // in a known-bad physical state.
       const badStatus =
         rt.state.status === "ERROR" || rt.state.status === "CHARGING" || rt.state.status === "UNKNOWN";
-      const isFreeIdle = !rt.leg && !badStatus && !this.book.byRobot(asCoreRobotId(id));
+      // Review round 3: a robot just recovered by the #15 watchdog reports
+      // no leg and no bad status — nothing else here excludes it — so
+      // without this it is instantly re-admitted to the idle pool and
+      // Hungarian, being distance-greedy, typically re-picks it FIRST
+      // (often the closest candidate, being wherever it just got stuck),
+      // promptly re-stalling the SAME way and burning the new order's
+      // 3-retry cap in roughly 3x watchdogTicks while other genuinely
+      // healthy robots sit idle. Contention-backstop and off-window
+      // recoveries do NOT set this cooldown (see executeRecovery) — those
+      // recover a healthy robot from unlucky circumstances (a temporary
+      // blocker, a drift event), not a suspected malfunction; only the
+      // watchdog — "this robot stopped making progress for no externally
+      // visible reason" — earns a mandatory cooldown to prove it can hold
+      // still before re-earning dispatch eligibility.
+      const cooling =
+        rt.dispatchCooldownUntilTick !== undefined && this.tickCount < rt.dispatchCooldownUntilTick;
+      const isFreeIdle = !rt.leg && !badStatus && !cooling && !this.book.byRobot(asCoreRobotId(id));
       if (!isFreeIdle) {
         rt.idleSinceTick = undefined;
         continue;
@@ -1113,7 +1180,7 @@ export class Orchestrator {
         if (!onCommittedPath) {
           leg.offWindowTicks++;
           if (leg.offWindowTicks >= 2) {
-            this.recoverLeg(id, rt, leg, `off committed path at ${rt.currentNodeId}`);
+            this.recoverLeg(id, rt, leg, `off committed path at ${rt.currentNodeId}`, false);
             continue;
           }
         } else {
@@ -1131,7 +1198,7 @@ export class Orchestrator {
         // so blockedTicks never moves off 0), or claims keep succeeding but
         // the robot itself never physically moves.
         if (this.tickCount - leg.lastProgressTick >= this.opts.watchdogTicks) {
-          this.recoverLeg(id, rt, leg, "no physical progress (watchdog)");
+          this.recoverLeg(id, rt, leg, "no physical progress (watchdog)", true);
           continue;
         }
       }
@@ -1160,6 +1227,15 @@ export class Orchestrator {
           const dedupedCells = Array.from(new Set(claimCells));
           const granted = this.reservations.claim(id, claimCells);
           if (granted.length === dedupedCells.length) {
+            // Review round 3 (#13 fix): a yield leg's cooldown is earned
+            // HERE, on its first genuine extension, not at dispatch time —
+            // see RobotRuntime.lastYieldTick's doc comment for why (a yield
+            // that never gets a chance to extend before being evaporated —
+            // see the send-guard below — must not burn the cooldown on a
+            // no-op retry).
+            if (leg.kind === "yield" && leg.nodeIds.length === 1) {
+              rt.lastYieldTick = this.tickCount;
+            }
             leg.nodeIds.push(nextNode);
             leg.blockedTicks = 0;
             changed = true;
@@ -1206,7 +1282,29 @@ export class Orchestrator {
         }
       }
 
-      if (!leg.sent || changed) {
+      // Review round 3 (#13 fix): a yield leg with exactly ONE committed
+      // node (its still-unextended starting position) is a meaningless
+      // mission — "go where you already are" — that a real adapter reports
+      // as trivially, instantly complete on the very next tick (identical
+      // to the frontier-race "resume" case's own already-there re-send
+      // logic above), clearing the yield leg via handleMissionDone before
+      // extension ever had a chance to physically move the robot out of
+      // the way at all. This specifically bites when the blocker robot is
+      // iterated AFTER the blocked robot within this same runRouting() pass
+      // (tryDispatchYield() is called from the BLOCKED robot's own
+      // iteration, part-way through this loop): the blocker's brand-new
+      // leg has no real PIBT-computed move for ITS true goal this tick —
+      // the `moves` map above was computed at the top of this method,
+      // BEFORE the leg existed, when the blocker was still registered as a
+      // leg-less agent — so its own extension attempt this tick can resolve
+      // to "no forward candidate"/"stay" and nodeIds never grows past 1.
+      // Withhold the send entirely until the leg has genuinely extended
+      // past its start node; ordinary `!leg.sent || changed` resumes
+      // sending normally from the tick that first succeeds onward (that
+      // extension sets `changed = true`, unconditionally satisfying this
+      // check on the very same iteration).
+      const yieldNotYetExtended = leg.kind === "yield" && leg.nodeIds.length === 1;
+      if (!yieldNotYetExtended && (!leg.sent || changed)) {
         const missionId = leg.missionId;
         const nodeIds = [...leg.nodeIds];
         void this.adapter
@@ -1261,7 +1359,11 @@ export class Orchestrator {
         `t=${this.tickCount} robot ${id} blocked ${leg.blockedTicks} ticks at ${deniedCell} — abandoning yield`
       );
     }
-    this.executeRecovery(id, rt, leg, "sustained reservation contention");
+    // Deadlock-backstop recovery never sets the dispatch cooldown: a robot
+    // stuck behind sustained reservation contention is healthy — the
+    // BLOCKER (or lack of a viable path) was at fault, not this robot —
+    // see recoverLeg()'s watchdog-only cooldown for the contrasting case.
+    this.executeRecovery(id, rt, leg, "sustained reservation contention", false);
   }
 
   /**
@@ -1273,13 +1375,22 @@ export class Orchestrator {
    * (requeueBlockedLeg()) uses — see that method's doc comment for why the
    * cancel/conditional-requeue/releaseAll/own-cell-re-claim/clear sequence
    * must exist in exactly one place.
+   *
+   * `cooldown`: review round 3 — true ONLY for the #15 watchdog call site.
+   * Off-window drift (#14) recovers a robot that was, until this exact
+   * moment, genuinely following its committed path (a transient swerve/bump
+   * knocked it off) — nothing suggests it can't immediately be trusted with
+   * a fresh order. The watchdog (#15) recovers a robot that silently
+   * stopped making progress for no externally visible reason — see
+   * RobotRuntime.dispatchCooldownUntilTick's doc comment for why THAT case
+   * specifically must not be instantly re-dispatched.
    */
-  private recoverLeg(id: RobotId, rt: RobotRuntime, leg: RobotLeg, reason: string): void {
+  private recoverLeg(id: RobotId, rt: RobotRuntime, leg: RobotLeg, reason: string, cooldown: boolean): void {
     this.pushAlarm(
       `t=${this.tickCount} robot ${id} ${reason} — recovering ` +
         `(${leg.kind === "order" ? "order requeued" : "yield abandoned"})`
     );
-    this.executeRecovery(id, rt, leg, reason);
+    this.executeRecovery(id, rt, leg, reason, cooldown);
   }
 
   /**
@@ -1302,8 +1413,19 @@ export class Orchestrator {
    * (claim() is a no-op on empty grant), so the robot would never recover
    * ownership of the cell it is still physically sitting on — a genuine
    * collision hole.
+   *
+   * `cooldown`: when true (the #15 watchdog, exclusively — see recoverLeg's
+   * doc comment), stamps RobotRuntime.dispatchCooldownUntilTick so
+   * runDispatch() excludes this robot from re-earning work until it proves
+   * it can hold still for a full watchdogTicks window.
    */
-  private executeRecovery(id: RobotId, rt: RobotRuntime, leg: RobotLeg, reason: string): void {
+  private executeRecovery(
+    id: RobotId,
+    rt: RobotRuntime,
+    leg: RobotLeg,
+    reason: string,
+    cooldown: boolean
+  ): void {
     if (leg.kind === "order") {
       try {
         this.book.requeue(leg.orderId, reason);
@@ -1317,6 +1439,9 @@ export class Orchestrator {
     this.reservations.releaseAll(id);
     if (rt.currentNodeId !== undefined) {
       this.reservations.claim(id, [cellKey(this.map.node(rt.currentNodeId).pos)]);
+    }
+    if (cooldown) {
+      rt.dispatchCooldownUntilTick = this.tickCount + this.opts.watchdogTicks;
     }
     setLeg(rt, undefined);
   }
@@ -1356,7 +1481,12 @@ export class Orchestrator {
       }
       const target = this.findYieldTarget(ownerId, blocker.currentNodeId, nodeId, blockedLeg);
       if (target === undefined) continue;
-      blocker.lastYieldTick = this.tickCount;
+      // Review round 3: lastYieldTick is deliberately NOT set here — see its
+      // doc comment on RobotRuntime. It's set later, in runRouting()'s
+      // extension-success branch, the first time this leg's nodeIds
+      // actually grows past its single starting node — i.e. only once the
+      // yield has committed real physical movement, not merely been
+      // dispatched.
       this.yieldCounter++;
       setLeg(blocker, {
         kind: "yield",
