@@ -46,6 +46,17 @@ export interface OrchestratorOpts {
    * legged robot's mission is presumed stuck and recovered; must exceed
    * blockedTicksLimit so the contention backstop wins where both apply.
    * Default 40.
+   *
+   * Coupling with offlineGraceMs: this watchdog (and the off-window check
+   * alongside it) only ever evaluates while the robot is reported ONLINE —
+   * see runRouting()'s `if (rt.online)` gate. A robot that goes offline is
+   * exclusively handleOfflineTimeouts()'s responsibility, gated on its own
+   * `offlineGraceMs` (a wall-clock duration, not a tick count). If
+   * `offlineGraceMs` (converted to ticks at the configured `tickMs`)
+   * outlasts `watchdogTicks`, that's fine — the gate means this watchdog
+   * simply never gets a chance to fire on that robot until it reports back
+   * online, so recovery still correctly goes through the offline path
+   * first, with its own, more accurate alarm.
    */
   watchdogTicks?: number;
   /** Injectable clock (ms epoch), for deterministic tests. Default Date.now. */
@@ -1006,34 +1017,74 @@ export class Orchestrator {
         }
       }
 
-      // #14: robot's reported node is nowhere on its committed window —
-      // physical drift (avoidance swerve, teleop, bump). Two consecutive
-      // ticks required: a single stale positional snap is routine (see
-      // lastVdaNodeId doc) and must not kill a healthy leg.
-      const windowNodes = leg.nodeIds.slice(leg.progressIndex);
-      if (!windowNodes.includes(rt.currentNodeId)) {
-        leg.offWindowTicks++;
-        if (leg.offWindowTicks >= 2) {
-          this.recoverLeg(id, rt, leg, `off committed path at ${rt.currentNodeId}`);
+      // #14/#15 are both skipped while the robot is reported OFFLINE: that
+      // recovery is already handleOfflineTimeouts()'s job, gated on its own
+      // opts.offlineGraceMs. Without this gate, an offline robot whose
+      // offlineGraceMs (in ms) outlasts watchdogTicks*tickMs would get its
+      // leg cleared and its order requeued HERE first, under a misleading
+      // "no physical progress" alarm that never mentions the robot is
+      // actually unreachable — and worse, would hand it straight back into
+      // the dispatch pool as if it were a healthy idle robot. See
+      // watchdogTicks' own doc comment for this coupling.
+      if (rt.online) {
+        // #14: robot's reported node is nowhere on its committed path at
+        // all — physical drift (avoidance swerve, teleop, bump). Checked
+        // against the WHOLE committed leg.nodeIds, not a window sliced from
+        // progressIndex onward, and rt.lastVdaNodeId is also accepted as a
+        // second, independent on-path signal — both fixes are load-bearing,
+        // caught by review against the first version of this check:
+        //
+        // (a) full-path, not windowed: rt.currentNodeId is written by BOTH
+        // the positional snap (handleEvent's "state" case, which
+        // unconditionally overwrites — even to an OLDER, already-passed,
+        // still-valid node) and the authoritative missionProgress-derived
+        // lastNodeId (handleEvent's "missionProgress" case) — see
+        // RobotRuntime.lastVdaNodeId's own doc comment for the exact race
+        // this produces. A truthful snap can legitimately arrive lagging
+        // BEHIND progressIndex (an already-passed node the robot is no
+        // longer standing on, but which the leg genuinely traversed) —
+        // slicing the membership test from progressIndex onward would
+        // wrongly flag that routine lag as off-path.
+        //
+        // (b) rt.lastVdaNodeId also accepted: mirrors the same dual-signal
+        // precedent handleMissionDone's reachedGoal/atFrontier guards
+        // establish. This one matters even with fix (a) applied: after a
+        // frontier-race RESUME, the leg is reseeded to JUST [frontierNode]
+        // (see that branch's own comment) — a stale positional snap still
+        // reporting the leg's PREVIOUS, now fully-discarded path would never
+        // be found in the new nodeIds at all, checked in full or otherwise,
+        // yet rt.lastVdaNodeId (confirmed via missionProgress) IS the
+        // frontier itself and correctly proves the robot is fine.
+        //
+        // Two consecutive ticks required: a single stale positional snap is
+        // routine and must not kill a healthy leg.
+        const onCommittedPath =
+          leg.nodeIds.includes(rt.currentNodeId) ||
+          (rt.lastVdaNodeId !== undefined && leg.nodeIds.includes(rt.lastVdaNodeId));
+        if (!onCommittedPath) {
+          leg.offWindowTicks++;
+          if (leg.offWindowTicks >= 2) {
+            this.recoverLeg(id, rt, leg, `off committed path at ${rt.currentNodeId}`);
+            continue;
+          }
+        } else {
+          leg.offWindowTicks = 0;
+        }
+
+        // #15: no physical progress for watchdogTicks — stuck-but-connected
+        // robot (fully-extended frontier, or lag-capped stall) that neither
+        // blocked-branch counter can see. watchdogTicks (default 40) is set
+        // greater than blockedTicksLimit (default 20): the contention
+        // backstop above wins whenever it would reach its own limit first
+        // (any genuinely-blocked-extension scenario resolves — one way or
+        // the other — well before this threshold), and this watchdog covers
+        // the rest: frontier already at goal (no extension ever attempted,
+        // so blockedTicks never moves off 0), or claims keep succeeding but
+        // the robot itself never physically moves.
+        if (this.tickCount - leg.lastProgressTick >= this.opts.watchdogTicks) {
+          this.recoverLeg(id, rt, leg, "no physical progress (watchdog)");
           continue;
         }
-      } else {
-        leg.offWindowTicks = 0;
-      }
-
-      // #15: no physical progress for watchdogTicks — stuck-but-connected
-      // robot (fully-extended frontier, or lag-capped stall) that neither
-      // blocked-branch counter can see. watchdogTicks (default 40) is set
-      // greater than blockedTicksLimit (default 20) specifically so that,
-      // whenever BOTH could apply (extension genuinely blocked), the
-      // contention backstop above (or a successful extension) always wins
-      // first — this only ever fires for the cases where extension is NOT
-      // blocked at all: frontier already at goal (no extension attempted,
-      // so blockedTicks never moves off 0), or claims keep succeeding but
-      // the robot itself never physically moves.
-      if (this.tickCount - leg.lastProgressTick >= this.opts.watchdogTicks) {
-        this.recoverLeg(id, rt, leg, "no physical progress (watchdog)");
-        continue;
       }
 
       const frontierIndex = leg.nodeIds.length - 1;
