@@ -161,7 +161,29 @@ export class PibtRouter {
       if (!assigned.has(agent.id)) pibt(agent.id);
     }
 
+    // #8: drop priority state for ids that are no longer in this step's
+    // agent set — otherwise `priorities` grows by one entry per DISTINCT
+    // agent id ever seen across the router's lifetime (e.g. a robot fleet
+    // with churn/replacement over a long-running process), never shrinking
+    // even though at most `agents.length` entries are ever live at once.
+    // Only prune when there's actually something to drop (cheap common-case
+    // check before the full key scan). A re-appearing id simply re-seeds
+    // via updatePriorities() on its next sighting — acceptable per the
+    // design (determinism WITHIN a run is unaffected: pruning only ever
+    // removes ids absent from the current step's `agents`, which never
+    // participate in this step's comparePriority() calls anyway).
+    if (this.priorities.size > byId.size) {
+      for (const id of this.priorities.keys()) {
+        if (!byId.has(id)) this.priorities.delete(id);
+      }
+    }
+
     return nextOf;
+  }
+
+  /** Test-only hook: live entry count in the internal priority map, for asserting the #8 prune keeps it bounded to the current agent set. */
+  _prioritySize(): number {
+    return this.priorities.size;
   }
 
   private updatePriorities(agents: Agent[]): void {

@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { WarehouseMap } from "@tez/core";
 import { FakeAdapter } from "@tez/robot-interface";
 import type { AdapterEvent, Mission } from "@tez/robot-interface";
-import type { RobotId, RobotState } from "@tez/shared";
+import type { RobotId, RobotState, CellKey } from "@tez/shared";
 import { cellKey } from "@tez/shared";
 import { Orchestrator } from "../src/orchestrator.js";
 
@@ -252,6 +252,98 @@ describe("Orchestrator", () => {
       const finalOrder = orchestrator.snapshot().orders.find((o) => o.id === order.id);
       expect(finalOrder?.robotId).not.toBe(originalRobot);
     });
+
+    it("review round 3 (minor 4): the offline alarm text reflects what actually happened, not always 'order requeued'", () => {
+      // Case 1: robot holding an ORDER leg goes offline -> "order requeued"
+      // (the pre-existing, already-correct case — pinned here alongside
+      // the other two for a single source of truth on the three outcomes).
+      {
+        const map = grid(4);
+        const adapter = new FakeAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+        const clock = fakeClock();
+        const orch = new Orchestrator(map, adapter, { now: clock.now, offlineGraceMs: 5_000 });
+        adapter.tick();
+        orch.tickOnce();
+        orch.submitOrder("n3_0", "n3_3");
+        adapter.tick();
+        orch.tickOnce();
+        expect(orch.snapshot().orders[0]?.status).toBe("dispatched");
+
+        adapter.setConnection("r1" as RobotId, false);
+        orch.tickOnce();
+        clock.advance(6_000);
+        orch.tickOnce();
+
+        expect(
+          orch.getAlarms().some((a) => a.includes("robot r1 offline") && a.includes("order requeued"))
+        ).toBe(true);
+      }
+
+      // Case 2: robot holding a YIELD leg (no order — see #13) goes offline
+      // -> "yield abandoned", NOT "order requeued" (there was no order to
+      // requeue: yield legs never touch the book).
+      {
+        const map = WarehouseMap.fromJSON(WarehouseMap.grid(3, 2));
+        const adapter = new FakeAdapter(
+          [
+            { id: "r1" as RobotId, startNodeId: "n0_0" },
+            { id: "r2" as RobotId, startNodeId: "n1_0" },
+          ],
+          map
+        );
+        const clock = fakeClock();
+        const orch = new Orchestrator(map, adapter, {
+          now: clock.now,
+          horizon: 3,
+          yieldAfterTicks: 3,
+          blockedTicksLimit: 30,
+          offlineGraceMs: 5_000,
+        });
+        adapter.tick();
+        orch.tickOnce();
+        orch.submitOrder("n0_0", "n2_0");
+        let yielded = false;
+        for (let i = 0; i < 20 && !yielded; i++) {
+          adapter.tick();
+          orch.tickOnce();
+          yielded = orch.getAlarms().some((a) => a.includes("asked to vacate to"));
+        }
+        expect(yielded).toBe(true);
+
+        // r2 now holds a fresh yield leg — take it offline immediately.
+        adapter.setConnection("r2" as RobotId, false);
+        orch.tickOnce();
+        clock.advance(6_000);
+        orch.tickOnce();
+
+        expect(
+          orch.getAlarms().some((a) => a.includes("robot r2 offline") && a.includes("yield abandoned"))
+        ).toBe(true);
+        expect(
+          orch.getAlarms().some((a) => a.includes("robot r2 offline") && a.includes("order requeued"))
+        ).toBe(false);
+      }
+
+      // Case 3: idle robot with no leg at all goes offline -> "no active
+      // work" (neither an order nor a yield was ever in flight for it).
+      {
+        const map = grid(3);
+        const adapter = new FakeAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+        const clock = fakeClock();
+        const orch = new Orchestrator(map, adapter, { now: clock.now, offlineGraceMs: 5_000 });
+        adapter.tick();
+        orch.tickOnce();
+
+        adapter.setConnection("r1" as RobotId, false);
+        orch.tickOnce();
+        clock.advance(6_000);
+        orch.tickOnce();
+
+        expect(
+          orch.getAlarms().some((a) => a.includes("robot r1 offline") && a.includes("no active work"))
+        ).toBe(true);
+      }
+    });
   });
 
   describe("retries exhausted", () => {
@@ -410,6 +502,99 @@ describe("Orchestrator", () => {
       expect(order2Dispatched).toBe(true);
       const order2State = orchestrator.snapshot().orders.find((o) => o.id === order2.id);
       expect(["r1", "r2"]).toContain(order2State?.robotId);
+    });
+
+    it("C1 re-pin: r1 is not permanently excluded from dispatch — a follow-up order goes to r1 while r2 is provably busy on order 1", () => {
+      // The test above was deliberately diluted to accept either robot
+      // completing order 1, because Task 2's reservation-blocking fix can
+      // legitimately hand order 1 back to either r1 or r2 depending on
+      // timing. That's correct for order 1, but it stopped pinning the
+      // ORIGINAL C1 guarantee this suite existed to prove: that a robot
+      // whose stale missionDone was correctly ignored (order-book
+      // bookkeeping untouched) is NOT left permanently wedged out of future
+      // dispatch. This test restores that guarantee deterministically by
+      // making r2 provably busy (a live leg on order 1) at the moment a
+      // SECOND order is submitted — runDispatch()'s `isFreeIdle` gate
+      // (!rt.leg && !badStatus && !book.byRobot(id)) then excludes r2 as a
+      // candidate entirely, so r1 is the ONLY eligible robot regardless of
+      // Hungarian distance weighting.
+      const map = grid(5);
+      const adapter = new UncancellableFakeAdapter(
+        [
+          { id: "r1", startNodeId: "n0_0" },
+          { id: "r2", startNodeId: "n4_4" },
+        ],
+        map
+      );
+      const clock = fakeClock();
+      const orchestrator = new Orchestrator(map, adapter, {
+        now: clock.now,
+        offlineGraceMs: 5_000,
+      });
+
+      const order1 = orchestrator.submitOrder("n2_0", "n4_4");
+
+      // r1 (closer) wins the dispatch and starts moving.
+      step(orchestrator, adapter);
+      step(orchestrator, adapter);
+      expect(orchestrator.snapshot().orders.find((o) => o.id === order1.id)?.robotId).toBe("r1");
+
+      // Knock r1 offline mid-pick, then let the grace period expire — order
+      // 1 requeues and r2 (idle) inherits it, same as the stale-report test
+      // above.
+      adapter.setConnection("r1", false);
+      orchestrator.tickOnce();
+      clock.advance(6_000);
+      orchestrator.tickOnce();
+
+      const afterGrace = orchestrator.snapshot().orders.find((o) => o.id === order1.id);
+      expect(afterGrace?.robotId).toBe("r2");
+      expect(["dispatched", "underway"]).toContain(afterGrace?.status);
+
+      // Revive r1. Its own FakeAdapter mission was never actually cancelled
+      // (cancelMission rejects), so it will eventually fire a stale
+      // missionDone that the C1 guard must ignore — exactly like the test
+      // above. Drive that stale report to completion so this test exercises
+      // the SAME mechanism, not a shortcut around it.
+      adapter.setConnection("r1", true);
+      orchestrator.tickOnce();
+
+      let staleReportSeen = false;
+      for (let i = 0; i < 10 && !staleReportSeen; i++) {
+        step(orchestrator, adapter);
+        staleReportSeen = orchestrator
+          .getAlarms()
+          .some((a) => a.includes("stale missionDone") && a.includes("r1"));
+      }
+      expect(staleReportSeen).toBe(true);
+
+      // r2 is still the legitimate, live holder of order 1 (a real leg, not
+      // yet complete over this 5x5 map) — provably busy. r1 has no leg at
+      // all (cleared by the offline handoff) and the C1 guard above did not
+      // touch order-book state for it. Submit a follow-up order now: r2 is
+      // excluded by isFreeIdle, so r1 MUST be assigned regardless of
+      // distance.
+      const stillBusy = orchestrator.snapshot().orders.find((o) => o.id === order1.id);
+      expect(stillBusy?.robotId).toBe("r2");
+      expect(["dispatched", "underway"]).toContain(stillBusy?.status);
+
+      const order2 = orchestrator.submitOrder("n0_1", "n0_2");
+      let order2Dispatched = false;
+      for (let i = 0; i < 10 && !order2Dispatched; i++) {
+        step(orchestrator, adapter);
+        const status = orchestrator.snapshot().orders.find((o) => o.id === order2.id)?.status;
+        order2Dispatched = status === "dispatched" || status === "underway";
+      }
+      expect(order2Dispatched).toBe(true);
+      expect(orchestrator.snapshot().orders.find((o) => o.id === order2.id)?.robotId).toBe("r1");
+
+      let order2Completed = false;
+      for (let i = 0; i < 60 && !order2Completed; i++) {
+        step(orchestrator, adapter);
+        order2Completed = orchestrator.snapshot().orders.find((o) => o.id === order2.id)?.status === "completed";
+      }
+      expect(order2Completed).toBe(true);
+      expect(orchestrator.snapshot().orders.find((o) => o.id === order2.id)?.robotId).toBe("r1");
     });
   });
 
@@ -1158,6 +1343,18 @@ describe("Orchestrator", () => {
             map.neighbors(m.nodeIds[i - 1]!).includes(m.nodeIds[i]!),
             `${m.robotId} ${m.id}: ${m.nodeIds[i - 1]} -> ${m.nodeIds[i]} not adjacent`
           ).toBe(true);
+          // #9 permanent guard: no self-edge [A, A] (consecutive duplicate
+          // node) can ever be wire-emitted. runRouting()'s extension only
+          // appends `nextNode` when `nextNode !== frontierNode`, initial
+          // legs seed with a single node, resume seeds with a single node
+          // (the confirmed frontier) — so no code path can ever push a
+          // duplicate of the last element. Verified here against every
+          // mission actually sent to the adapter across a skewed-cadence,
+          // two-robot, two-order run.
+          expect(
+            m.nodeIds[i] !== m.nodeIds[i - 1],
+            `${m.robotId} ${m.id}: self-edge [${m.nodeIds[i - 1]}, ${m.nodeIds[i]}] at index ${i}`
+          ).toBe(true);
         }
       }
     });
@@ -1491,6 +1688,1046 @@ describe("Orchestrator", () => {
       expect(sent.length).toBe(2);
       expect(sent[0]!.nodeIds).toEqual(sent[1]!.nodeIds);
 
+      let completed = false;
+      for (let i = 0; i < 60 && !completed; i++) {
+        adapter.tick();
+        orch.tickOnce();
+        completed = orch.snapshot().orders.find((o) => o.id === order.id)?.status === "completed";
+      }
+      expect(completed).toBe(true);
+    });
+  });
+
+  /**
+   * Shared 3x2-corridor setup for the yield-dispatch tests below: r1 at
+   * n0_0, r2 idle-parked at n1_0. 3x1 would have NO side-step cell for r2
+   * to yield into (see the dedicated 3x1 test), so 3x2 gives r2 somewhere
+   * legal to go (e.g. n1_1). Registers both robots (one adapter+orchestrator
+   * tick) before returning. `sent` is `spyMissions`' running log, useful for
+   * asserting what a robot's actual sent paths were.
+   */
+  function setupYieldCorridor(orchOpts: Partial<{
+    yieldAfterTicks: number;
+    yieldCooldownTicks: number;
+    blockedTicksLimit: number;
+  }> = {}): {
+    map: WarehouseMap;
+    adapter: FakeAdapter;
+    sent: Array<{ robotId: string; id: string; nodeIds: string[] }>;
+    orch: Orchestrator;
+  } {
+    const map = WarehouseMap.fromJSON(WarehouseMap.grid(3, 2));
+    const adapter = new FakeAdapter(
+      [
+        { id: "r1" as RobotId, startNodeId: "n0_0" },
+        { id: "r2" as RobotId, startNodeId: "n1_0" },
+      ],
+      map
+    );
+    const sent = spyMissions(adapter);
+    const orch = new Orchestrator(map, adapter, {
+      horizon: 3,
+      yieldAfterTicks: 3,
+      blockedTicksLimit: 30, // backstop far away by default: yield must be what resolves it
+      ...orchOpts,
+    });
+    adapter.tick();
+    orch.tickOnce();
+    return { map, adapter, sent, orch };
+  }
+
+  describe("yield dispatch (#13)", () => {
+    it("a parked idle robot yields out of the only corridor and the order completes", () => {
+      const { adapter, sent, orch } = setupYieldCorridor();
+      // r2 must NOT take the order: dispatch is distance-based Hungarian, so
+      // submit the order pickup at r1's own cell (distance 0). r1's pick leg
+      // completes instantly (already there), then the DROP leg n0_0->n2_0
+      // must cross r2 at n1_0.
+      const order = orch.submitOrder("n0_0", "n2_0");
+      let completed = false;
+      for (let i = 0; i < 120 && !completed; i++) {
+        adapter.tick();
+        orch.tickOnce();
+        completed =
+          orch.snapshot().orders.find((o) => o.id === order.id)?.status === "completed";
+      }
+      expect(completed).toBe(true);
+      const alarms = orch.getAlarms();
+      const yieldAlarm = alarms.find((a) => a.includes("asked to vacate to"));
+      expect(yieldAlarm).toBeDefined();
+      // The yield must have resolved it BEFORE any backstop requeue — and
+      // also before any #14/#15 recovery ("recovering (order requeued)")
+      // intruding on a leg that is behaving normally; either alarm shape
+      // requeueing the order here would mean this test's own yield episode
+      // is spuriously tripping the off-window/watchdog checks, which must
+      // not pass silently.
+      expect(
+        alarms.some(
+          (a) => a.includes("requeueing order") || a.includes("recovering (order requeued)")
+        )
+      ).toBe(false);
+
+      // Review finding (Important): the yield target must not be the
+      // blocked robot's own goal, nor anywhere on its actual traveled
+      // path — otherwise the "yield" just relocates the blocker onto the
+      // very route it's supposed to be clearing, trading one deadlock for
+      // an equivalent (or worse) one instead of resolving it.
+      const match = yieldAlarm!.match(/asked to vacate to (\S+) \(blocking/);
+      expect(match).not.toBeNull();
+      const yieldTarget = match![1]!;
+      expect(yieldTarget).not.toBe("n2_0"); // the order's drop node
+      const r1Nodes = new Set(sent.filter((m) => m.robotId === "r1").flatMap((m) => m.nodeIds));
+      expect(r1Nodes.has(yieldTarget)).toBe(false);
+
+      // r2 ended up somewhere, still owns its own cell (invariant):
+      const r2 = adapter.robots().find((r) => r.id === "r2")!;
+      const r2cell: CellKey = cellKey(r2.pos);
+      expect(orch._reservationOwner(r2cell)).toBe("r2");
+    });
+
+    it("yield legs never touch the order book and clear on completion", () => {
+      // Same corridor setup as above: r1's drop leg must cross r2 parked at
+      // n1_0, forcing a yield.
+      const { map, adapter, orch } = setupYieldCorridor();
+      const order = orch.submitOrder("n0_0", "n2_0");
+      let completed = false;
+      // The brief's actual claim: r2 never becomes ANY order's holder while
+      // the yield is in flight. Poll every tick (not just once at the end)
+      // so a hypothetical transient assign-then-unassign within a single
+      // tick can't slip past an end-of-loop-only check.
+      let everSawR2Assigned = false;
+      for (let i = 0; i < 120 && !completed; i++) {
+        adapter.tick();
+        orch.tickOnce();
+        if (orch.snapshot().orders.some((o) => o.robotId === "r2")) {
+          everSawR2Assigned = true;
+        }
+        completed =
+          orch.snapshot().orders.find((o) => o.id === order.id)?.status === "completed";
+      }
+      expect(completed).toBe(true);
+      expect(everSawR2Assigned).toBe(false);
+      expect(orch.getAlarms().some((a) => a.includes("asked to vacate to"))).toBe(true);
+
+      // The yield leg never touched the order book: r2 never became this
+      // order's robot.
+      const finalOrder = orch.snapshot().orders.find((o) => o.id === order.id)!;
+      expect(finalOrder.robotId).toBe("r1");
+
+      // r2's leg is cleared at the end: it's dispatchable again. Submit a
+      // fresh order pinned exactly at r2's current cell (distance 0, so
+      // Hungarian must assign it to r2 regardless of where r2 ended up) and
+      // confirm r2 takes and completes it.
+      const r2 = adapter.robots().find((r) => r.id === "r2")!;
+      const r2NodeId = `n${r2.pos.x}_${r2.pos.y}`;
+      const otherNode = map.nodeIds.find((n) => n !== r2NodeId)!;
+      const order2 = orch.submitOrder(r2NodeId, otherNode);
+      let completed2 = false;
+      for (let i = 0; i < 60 && !completed2; i++) {
+        adapter.tick();
+        orch.tickOnce();
+        completed2 =
+          orch.snapshot().orders.find((o) => o.id === order2.id)?.status === "completed";
+      }
+      expect(completed2).toBe(true);
+      expect(orch.snapshot().orders.find((o) => o.id === order2.id)?.robotId).toBe("r2");
+    });
+
+    it("no qualifying blocker means no yield and the backstop still fires", () => {
+      // Blocker is OFFLINE (setConnection(false) after registration): yield
+      // must NOT be dispatched to an offline robot; order eventually fails
+      // via backstop (blockedTicksLimit small) — the strictly-better
+      // property: behavior degrades to pre-yield behavior, never worse.
+      const { adapter, orch } = setupYieldCorridor({ blockedTicksLimit: 5 });
+      adapter.setConnection("r2" as RobotId, false);
+      orch.tickOnce();
+      const order = orch.submitOrder("n0_0", "n2_0");
+      let terminal = false;
+      for (let i = 0; i < 60 && !terminal; i++) {
+        adapter.tick();
+        orch.tickOnce();
+        terminal = orch.snapshot().orders.find((o) => o.id === order.id)?.status === "failed";
+      }
+      expect(terminal).toBe(true);
+      const alarms = orch.getAlarms();
+      expect(alarms.some((a) => a.includes("yield") && a.includes("r2"))).toBe(false);
+      expect(alarms.some((a) => a.includes("requeueing order"))).toBe(true);
+    });
+
+    it("3x1 corridor with no side-step cell: no yield is dispatched, backstop still resolves it", () => {
+      // Review finding (Important, regression coverage): findYieldTarget
+      // now excludes the blocked robot's own route/goal from candidacy. On
+      // a bare 3x1 corridor, r2's only two neighbors (n0_0 and n2_0) are
+      // BOTH on the blocked robot's route (n0_0 is its own current
+      // position, n2_0 is its goal) and nothing else is reachable within
+      // the BFS depth cap — so no valid yield target exists at all. Confirm
+      // yield is never even attempted (no "asked to vacate to" alarm) and
+      // the deadlock backstop alone resolves it exactly as it did before
+      // #13 existed — the strictly-better property.
+      const map = WarehouseMap.fromJSON(WarehouseMap.grid(3, 1));
+      const adapter = new FakeAdapter(
+        [
+          { id: "r1" as RobotId, startNodeId: "n0_0" },
+          { id: "r2" as RobotId, startNodeId: "n1_0" },
+        ],
+        map
+      );
+      const orch = new Orchestrator(map, adapter, {
+        horizon: 3,
+        yieldAfterTicks: 3,
+        blockedTicksLimit: 10,
+      });
+      adapter.tick();
+      orch.tickOnce();
+      // Same "pickup at r1's own cell" trick as the other yield tests:
+      // r1 is assigned (distance 0), its pick leg completes instantly, and
+      // the drop leg n0_0->n2_0 is blocked by r2 parked at n1_0.
+      const order = orch.submitOrder("n0_0", "n2_0");
+      let terminal = false;
+      for (let i = 0; i < 200 && !terminal; i++) {
+        adapter.tick();
+        orch.tickOnce();
+        terminal = orch.snapshot().orders.find((o) => o.id === order.id)?.status === "failed";
+      }
+      expect(terminal).toBe(true);
+      const alarms = orch.getAlarms();
+      expect(alarms.some((a) => a.includes("asked to vacate to"))).toBe(false);
+      expect(alarms.some((a) => a.includes("requeueing order"))).toBe(true);
+    });
+
+    it("#13 mission-id-shape gap: a stale yield missionFailed does not clear a live ORDER leg", () => {
+      // Review finding (Important): a late `yield:<id>#<n>` missionFailed
+      // draining AFTER that yield leg was already superseded by a brand-new
+      // ORDER leg must be recognized as a stale yield report by missionId
+      // SHAPE alone, not by the robot's CURRENT leg kind — otherwise it
+      // falls through to the unparseable-mission-id branch, which
+      // unconditionally clears rt.leg, silently killing the live order leg
+      // while the order stays dispatched/underway in the book forever
+      // (robot excluded from redispatch, order never requeued — hung).
+      //
+      // Reproduced by direct event injection (ScriptableAdapter), since
+      // nothing here ever dispatches a real yield leg to r2 — this is
+      // purely about missionId shape, not an actual yield scenario.
+      const map = grid(4);
+      const adapter = new ScriptableAdapter([{ id: "r2" as RobotId, startNodeId: "n0_0" }], map);
+      const orch = new Orchestrator(map, adapter, {});
+      adapter.tick();
+      orch.tickOnce();
+      const order = orch.submitOrder("n2_0", "n3_3");
+
+      // Drive it forward until r2 genuinely holds a live, non-terminal
+      // order leg (dispatched or underway — either proves the leg exists).
+      let holding = false;
+      for (let i = 0; i < 20 && !holding; i++) {
+        adapter.tick();
+        orch.tickOnce();
+        const status = orch.snapshot().orders.find((o) => o.id === order.id)?.status;
+        holding = status === "dispatched" || status === "underway";
+      }
+      expect(holding).toBe(true);
+      expect(orch.snapshot().orders.find((o) => o.id === order.id)?.robotId).toBe("r2");
+      const statusBefore = orch.snapshot().orders.find((o) => o.id === order.id)?.status;
+
+      adapter.injectEvent({
+        type: "missionFailed",
+        robotId: "r2" as RobotId,
+        missionId: "yield:r2#1",
+        reason: "stale test injection",
+      });
+      orch.tickOnce();
+
+      // The live order leg must be untouched: status unchanged, still r2's.
+      const afterOrder = orch.snapshot().orders.find((o) => o.id === order.id)!;
+      expect(afterOrder.status).toBe(statusBefore);
+      expect(afterOrder.robotId).toBe("r2");
+      expect(
+        orch.getAlarms().some((a) => a.includes("stale yield missionFailed") && a.includes("r2"))
+      ).toBe(true);
+
+      // And the order goes on to complete normally — direct proof the leg
+      // survived (a cleared leg would never progress or complete again).
+      let completed = false;
+      for (let i = 0; i < 60 && !completed; i++) {
+        adapter.tick();
+        orch.tickOnce();
+        completed =
+          orch.snapshot().orders.find((o) => o.id === order.id)?.status === "completed";
+      }
+      expect(completed).toBe(true);
+    });
+
+    it("review round 3: a yield mission is only sent once it has >=2 nodes, never as a meaningless 1-node send", () => {
+      // Regression for: tryDispatchYield() seeds a fresh yield leg with
+      // nodeIds:[current], sent:false. If the blocker is iterated (in
+      // Map/registration order) AFTER the blocked robot within the SAME
+      // runRouting() pass — which is exactly when tryDispatchYield() is
+      // called, from partway through the blocked robot's own iteration —
+      // the blocker's brand-new leg has no real PIBT-computed move for its
+      // true goal THIS tick (the `moves` map was computed at the top of
+      // runRouting(), before the leg existed, when the blocker was still a
+      // leg-less stationary agent). Without a guard, the send block below
+      // would emit a bare 1-node mission; a real (or fake) adapter reports
+      // "arrived" on it instantly, clearing the yield leg via
+      // handleMissionDone before extension ever gets a chance to physically
+      // move the robot — the blocked episode's one-shot yield attempt is
+      // wasted for nothing, and the order falls through to the deadlock
+      // backstop instead of ever being resolved by the yield.
+      //
+      // Deterministic repro: 3x2 corridor (r1 at n0_0 -> n2_0), r2 parked at
+      // n1_0 (the blocker), r3 parked at n1_1 and r4 parked at n2_0's
+      // neighbor n2_0 itself — WAIT, r4 sits AT n2_0 as a second permanent
+      // obstacle (r1's own destination), and r3 temporarily occupies n1_1.
+      // At the tick r1's blockedTicks reaches yieldAfterTicks, r2 is boxed
+      // in on all three of its neighbors (n0_0=r1, n2_0=r4, n1_1=r3) — PIBT
+      // cannot push it ANYWHERE this tick, so `moves.get(r2)` resolves to
+      // "stay" (not a real move), exactly the race this guards against.
+      // findYieldTarget's own BFS (a separate, deeper search) still finds a
+      // 2-hop-away target and dispatches the yield leg regardless — so the
+      // leg exists, stuck at its single starting node, for several ticks.
+      // Once r3's own (separately submitted, reactively — see below) order
+      // moves it away from n1_1, PIBT can finally push r2 there for real,
+      // and the corridor fully resolves: r1 gets past r2, and later past
+      // r4 too (which gets its own yield dispatched once R1 reaches it).
+      const map = WarehouseMap.fromJSON(WarehouseMap.grid(3, 2));
+      const adapter = new FakeAdapter(
+        [
+          { id: "r1" as RobotId, startNodeId: "n0_0" },
+          { id: "r2" as RobotId, startNodeId: "n1_0" },
+          { id: "r3" as RobotId, startNodeId: "n1_1" },
+          { id: "r4" as RobotId, startNodeId: "n2_0" },
+        ],
+        map
+      );
+      const sent = spyMissions(adapter);
+      const orch = new Orchestrator(map, adapter, {
+        horizon: 3,
+        yieldAfterTicks: 3,
+        blockedTicksLimit: 30,
+      });
+      adapter.tick();
+      orch.tickOnce();
+      const order = orch.submitOrder("n0_0", "n2_0");
+
+      // Reactively free r3 out of n1_1 the moment the FIRST yield fires (it
+      // must still be sitting there AT that exact tick to force the "boxed
+      // in, PIBT resolves to stay" race — freeing it any earlier would let
+      // PIBT push r2 there directly, never exercising the guard at all).
+      let freedR3 = false;
+      let completed = false;
+      for (let i = 0; i < 80 && !completed; i++) {
+        adapter.tick();
+        orch.tickOnce();
+        if (!freedR3 && orch.getAlarms().some((a) => a.includes("asked to vacate to"))) {
+          freedR3 = true;
+          orch.submitOrder("n1_1", "n0_1");
+        }
+        completed = orch.snapshot().orders.find((o) => o.id === order.id)?.status === "completed";
+      }
+
+      expect(completed).toBe(true);
+      // The fix's actual invariant: every mission ever sent whose id has
+      // the yield shape must have at least 2 committed nodes — a 1-node
+      // send is never meaningful and must never reach the adapter.
+      const yieldSends = sent.filter((m) => m.id.startsWith("yield:"));
+      expect(yieldSends.length).toBeGreaterThan(0); // sanity: yield actually happened
+      for (const m of yieldSends) {
+        expect(m.nodeIds.length, `${m.id} sent with only ${m.nodeIds.length} node(s)`).toBeGreaterThanOrEqual(2);
+      }
+      // The corridor resolves via the yields alone — the wasted-episode bug
+      // this guards against would have forced at least one deadlock-backstop
+      // requeue cycle before eventually recovering; with the fix, none are
+      // needed at all.
+      expect(orch.getAlarms().some((a) => a.includes("— requeueing order"))).toBe(false);
+    });
+  });
+
+  describe("off-window reconciliation (#14)", () => {
+    it("a robot reported off its committed path gets its order requeued and cell re-claimed", () => {
+      // Drive the leg's COMMITMENT forward (horizon-gated extension, purely
+      // reservation-driven) WITHOUT ever calling adapter.tick(): this
+      // deliberately keeps rt.lastVdaNodeId undefined for the whole test
+      // (only missionProgress events — themselves only ever emitted by
+      // adapter.tick() — set it), isolating fix (a) (full committed-path
+      // membership) from fix (b)'s rt.lastVdaNodeId fallback, which would
+      // otherwise let a stale-but-genuinely-on-path lastVdaNodeId mask a
+      // real drift for the rest of the leg's lifetime once the robot has
+      // ever legitimately moved even once. Then inject two consecutive
+      // state events snapping the robot to a node NOT anywhere on its
+      // committed path (grid(4,4), teleport to the far corner). Expect:
+      // "off committed path" alarm, order requeued (retries incremented,
+      // order back to queued), robot's holds released, its ACTUAL current
+      // cell re-claimed (via _reservationOwner).
+      const map = grid(4);
+      const adapter = new ScriptableAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      const orch = new Orchestrator(map, adapter, {});
+      adapter.tick();
+      orch.tickOnce();
+      const order = orch.submitOrder("n3_0", "n0_3");
+
+      // Dispatch, then let a couple more orchestrator-only ticks commit
+      // further extension ahead of the robot's (unmoved) true position —
+      // "partway" in commitment, not physical travel. No adapter.tick() at
+      // any point, so no missionProgress ever fires for this leg.
+      orch.tickOnce();
+      orch.tickOnce();
+      const dispatchedBefore = orch.snapshot().orders.find((o) => o.id === order.id);
+      expect(dispatchedBefore?.status).toBe("dispatched");
+      const beforeDrift = orch.snapshot().robots.find((r) => r.id === "r1")!;
+      expect(beforeDrift.pos).toEqual(map.node("n0_0").pos); // sanity: never physically moved
+
+      // Two consecutive off-window snaps to the far corner (n3_3) — nowhere
+      // on the committed path toward n3_0.
+      adapter.injectEvent({
+        type: "state",
+        state: { ...beforeDrift, pos: map.node("n3_3").pos },
+      });
+      orch.tickOnce();
+      expect(
+        orch.getAlarms().some((a) => a.includes("off committed path"))
+      ).toBe(false); // single stale snap must not trip it yet
+
+      adapter.injectEvent({
+        type: "state",
+        state: { ...beforeDrift, pos: map.node("n3_3").pos },
+      });
+      orch.tickOnce();
+
+      expect(
+        orch.getAlarms().some((a) => a.includes("off committed path") && a.includes("r1"))
+      ).toBe(true);
+
+      const afterOrder = orch.snapshot().orders.find((o) => o.id === order.id)!;
+      expect(afterOrder.status).toBe("queued");
+      expect(afterOrder.retries).toBeGreaterThanOrEqual(1);
+
+      const r1After = orch.snapshot().robots.find((r) => r.id === "r1")!;
+      expect(r1After.pos).toEqual(map.node("n3_3").pos);
+      expect(orch._reservationOwner(cellKey(r1After.pos))).toBe("r1");
+    });
+
+    it("a single-tick stale snap does NOT trigger recovery", () => {
+      // One off-window state event followed by an on-window one: no alarm,
+      // leg intact, order completes normally.
+      const map = grid(4);
+      const adapter = new ScriptableAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      const orch = new Orchestrator(map, adapter, {});
+      adapter.tick();
+      orch.tickOnce();
+      const order = orch.submitOrder("n2_0", "n0_2");
+
+      step(orch, adapter);
+      const r1 = orch.snapshot().robots.find((r) => r.id === "r1")!;
+
+      // One off-window snap...
+      adapter.injectEvent({
+        type: "state",
+        state: { ...r1, pos: map.node("n3_3").pos },
+      });
+      orch.tickOnce();
+      expect(orch.getAlarms().some((a) => a.includes("off committed path"))).toBe(false);
+
+      // ...followed by an on-window one (revert to the real current node) —
+      // the transient snap tolerance must reset, not accumulate.
+      adapter.injectEvent({
+        type: "state",
+        state: { ...r1, pos: r1.pos },
+      });
+      orch.tickOnce();
+      expect(orch.getAlarms().some((a) => a.includes("off committed path"))).toBe(false);
+
+      let completed = false;
+      for (let i = 0; i < 60 && !completed; i++) {
+        step(orch, adapter);
+        completed = orch.snapshot().orders.find((o) => o.id === order.id)?.status === "completed";
+      }
+      expect(completed).toBe(true);
+      expect(orch.getAlarms().some((a) => a.includes("off committed path"))).toBe(false);
+    });
+
+    it("repeated off-window/on-window alternation never accumulates (offWindowTicks resets every on-window tick)", () => {
+      // Review finding (Important 4): the single-alternation test above
+      // would still pass even if offWindowTicks were cumulative across
+      // NON-consecutive off ticks (it only ever tests one off, one on).
+      // Repeat the off->on cycle several times — if the counter were wrongly
+      // cumulative (e.g. never reset, or only reset on a genuine progress
+      // advance rather than every on-window tick), five single-tick offs
+      // would sum past the >=2 threshold and wrongly recover a leg that in
+      // fact never had two CONSECUTIVE off ticks. Assert the leg survives
+      // every cycle and the order completes normally.
+      const map = grid(4);
+      const adapter = new ScriptableAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      const orch = new Orchestrator(map, adapter, {});
+      adapter.tick();
+      orch.tickOnce();
+      const order = orch.submitOrder("n3_0", "n0_3");
+      orch.tickOnce();
+      const r1 = orch.snapshot().robots.find((r) => r.id === "r1")!;
+
+      for (let cycle = 0; cycle < 5; cycle++) {
+        adapter.injectEvent({
+          type: "state",
+          state: { ...r1, pos: map.node("n3_3").pos },
+        });
+        orch.tickOnce();
+        adapter.injectEvent({
+          type: "state",
+          state: { ...r1, pos: r1.pos },
+        });
+        orch.tickOnce();
+      }
+      expect(orch.getAlarms().some((a) => a.includes("off committed path"))).toBe(false);
+      expect(orch.snapshot().orders.find((o) => o.id === order.id)?.status).toBe("dispatched");
+
+      let completed = false;
+      for (let i = 0; i < 60 && !completed; i++) {
+        step(orch, adapter);
+        completed = orch.snapshot().orders.find((o) => o.id === order.id)?.status === "completed";
+      }
+      expect(completed).toBe(true);
+      expect(orch.getAlarms().some((a) => a.includes("off committed path"))).toBe(false);
+    });
+
+    it("CRITICAL regression: a resumed leg survives a subsequent event-free tick (reviewer repro A, based on test (e))", () => {
+      // Reviewer-reported false positive against the first version of this
+      // check (Critical): after a frontier-race RESUME (handleMissionDone
+      // reseeds nodeIds to JUST [frontierNode]), the windowed
+      // (leg.nodeIds.slice(progressIndex)) membership test — with no
+      // rt.lastVdaNodeId fallback — flagged the very NEXT event-free tick as
+      // off-window too (rt.currentNodeId is sticky, still the stale
+      // pre-resume snap that was never part of the reseeded 1-node path),
+      // reaching the 2-consecutive threshold and requeueing a perfectly
+      // healthy, just-resumed leg. Reproduces test (e)'s exact scenario
+      // (see "(e) committed-path-complete resume via authoritative
+      // lastVdaNodeId..." above) plus ONE additional event-free tickOnce().
+      const map = grid(5);
+      const adapter = new ScriptableAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      // Small horizon so the pick leg's frontier caps well short of the
+      // pickup goal (n0_0 -> n1_0 -> n2_0, horizon 2, goal n4_0).
+      const orchestrator = new Orchestrator(map, adapter, { horizon: 2 });
+      adapter.tick();
+      orchestrator.tickOnce();
+      const order = orchestrator.submitOrder("n4_0", "n0_0");
+
+      orchestrator.tickOnce(); // dispatch + first extension attempt(s)
+      step(orchestrator, adapter); // one physical step: robot moves to n1_0, one behind the n2_0 frontier
+      const r1 = orchestrator.snapshot().robots.find((r) => r.id === "r1");
+      expect(r1?.pos).toEqual(map.node("n1_0").pos);
+
+      const missionId = `${order.id}:pick`;
+      // Same race as test (e): missionProgress confirms the frontier n2_0
+      // (sets both rt.lastVdaNodeId AND rt.currentNodeId), then a stale
+      // state event regresses rt.currentNodeId back to n1_0, then
+      // missionDone triggers the resume (reseeding nodeIds to ["n2_0"]).
+      adapter.injectEvent({
+        type: "missionProgress",
+        robotId: "r1",
+        missionId,
+        lastNodeId: "n2_0",
+      });
+      adapter.injectEvent({
+        type: "state",
+        state: { ...r1!, pos: map.node("n1_0").pos, status: "EXECUTING" },
+      });
+      adapter.injectEvent({ type: "missionDone", robotId: "r1", missionId });
+      orchestrator.tickOnce();
+
+      expect(orchestrator.getAlarms().some((a) => a.includes("resuming, not requeueing"))).toBe(true);
+      expect(orchestrator.getAlarms().some((a) => a.includes("off committed path"))).toBe(false);
+
+      // The reviewer's exact repro: ONE additional event-free tick (no new
+      // adapter/injected events at all — rt.currentNodeId stays sticky at
+      // the stale "n1_0"). Pre-fix, this alone pushed offWindowTicks from 1
+      // (accrued during the resume tick itself) to 2, requeueing the order.
+      orchestrator.tickOnce();
+
+      expect(orchestrator.getAlarms().some((a) => a.includes("off committed path"))).toBe(false);
+      const afterOrder = orchestrator.snapshot().orders.find((o) => o.id === order.id)!;
+      expect(afterOrder.status).toBe("dispatched");
+      expect(afterOrder.retries).toBe(0);
+    });
+
+    it("CRITICAL regression: a truthful but lagging position snap does not requeue an on-path robot (reviewer repro B)", () => {
+      // Reviewer-reported false positive (Critical): missionProgress sets
+      // BOTH rt.lastVdaNodeId and rt.currentNodeId to the confirmed node,
+      // advancing progressIndex to it. A SUBSEQUENT truthful "state" event
+      // reporting an EARLIER, already-traversed node (routine lag between
+      // the position sensor and the VDA node-reached signal — see
+      // RobotRuntime.lastVdaNodeId's own doc comment) unconditionally
+      // overwrites rt.currentNodeId backward. Windowed
+      // (leg.nodeIds.slice(progressIndex)) membership does not contain that
+      // earlier node (it's BEHIND progressIndex, sliced out) — two such
+      // truthful lagging snaps in a row would wrongly requeue a genuinely
+      // on-path, healthy robot. Reproduced directly via injectEvent (no
+      // resume/frontier-race involved this time — a plain mid-leg lag).
+      const map = grid(5);
+      const adapter = new ScriptableAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      const orchestrator = new Orchestrator(map, adapter, { horizon: 5 });
+      adapter.tick();
+      orchestrator.tickOnce();
+      const order = orchestrator.submitOrder("n4_0", "n0_0");
+      orchestrator.tickOnce(); // dispatch + first extension step
+
+      // Let extension fully commit the path all the way to the goal
+      // (n0_0..n4_0, 4 hops) BEFORE any position report arrives — purely
+      // reservation-driven, no adapter.tick(), no events, robot's true
+      // position stays n0_0 throughout. This is essential for the repro:
+      // progressIndex must be able to advance to n3_0's index (3) with n2_0
+      // already committed BEHIND it, or the later "lag" report would just
+      // look like ordinary never-yet-reached forward progress instead of a
+      // genuine lag behind an already-confirmed position.
+      for (let i = 0; i < 5; i++) orchestrator.tickOnce();
+
+      // missionProgress confirms n3_0 as reached — sets rt.lastVdaNodeId AND
+      // rt.currentNodeId to n3_0, advancing progressIndex past n2_0.
+      const missionId = `${order.id}:pick`;
+      adapter.injectEvent({
+        type: "missionProgress",
+        robotId: "r1",
+        missionId,
+        lastNodeId: "n3_0",
+      });
+      orchestrator.tickOnce();
+      expect(orchestrator.getAlarms().some((a) => a.includes("off committed path"))).toBe(false);
+
+      const r1AtN3 = orchestrator.snapshot().robots.find((r) => r.id === "r1")!;
+
+      // Two consecutive truthful-but-lagging snaps reporting the EARLIER,
+      // already-passed node n2_0 — no missionProgress accompanying either
+      // (so rt.lastVdaNodeId stays at the genuinely-confirmed n3_0, which
+      // fix (b) alone would already save here — this test specifically
+      // isolates fix (a), the full-path-not-windowed membership check, by
+      // also asserting the underlying mechanics: n2_0 IS on leg.nodeIds,
+      // just behind progressIndex).
+      adapter.injectEvent({
+        type: "state",
+        state: { ...r1AtN3, pos: map.node("n2_0").pos },
+      });
+      orchestrator.tickOnce();
+      expect(orchestrator.getAlarms().some((a) => a.includes("off committed path"))).toBe(false);
+
+      adapter.injectEvent({
+        type: "state",
+        state: { ...r1AtN3, pos: map.node("n2_0").pos },
+      });
+      orchestrator.tickOnce();
+
+      expect(orchestrator.getAlarms().some((a) => a.includes("off committed path"))).toBe(false);
+      const afterOrder = orchestrator.snapshot().orders.find((o) => o.id === order.id)!;
+      expect(afterOrder.status).not.toBe("queued");
+      expect(afterOrder.retries).toBe(0);
+
+      // And the order goes on to complete normally afterward, driven by
+      // real adapter ticks (direct proof the leg genuinely survived).
+      let completed = false;
+      for (let i = 0; i < 60 && !completed; i++) {
+        step(orchestrator, adapter);
+        completed =
+          orchestrator.snapshot().orders.find((o) => o.id === order.id)?.status === "completed";
+      }
+      expect(completed).toBe(true);
+      expect(orchestrator.getAlarms().some((a) => a.includes("off committed path"))).toBe(false);
+    });
+  });
+
+  describe("physical-progress watchdog (#15)", () => {
+    it("a connected robot that stops moving on a fully-extended path is recovered", () => {
+      // 1 robot, order with a short leg so frontier reaches goal quickly
+      // (pickup = robot's own current cell, so the pick leg's frontier
+      // equals its goal from the moment it's created — extension is never
+      // even attempted, so the deadlock backstop's blockedTicks counter
+      // never moves off 0). Then never call adapter.tick() again (robot
+      // frozen, still online, no state/progress events at all) while
+      // ticking the orchestrator watchdogTicks+2 times. blockedTicksLimit is
+      // set far away so the watchdog is unambiguously what fires.
+      const map = grid(3);
+      const adapter = new ScriptableAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      const orch = new Orchestrator(map, adapter, { watchdogTicks: 8, blockedTicksLimit: 30 });
+      adapter.tick();
+      orch.tickOnce();
+      const order = orch.submitOrder("n0_0", "n2_2");
+      orch.tickOnce(); // dispatch: pick leg created (frontier === goal already), sent once
+
+      const dispatched = orch.snapshot().orders.find((o) => o.id === order.id);
+      expect(dispatched?.status).toBe("dispatched");
+
+      // Freeze: no more adapter.tick() calls at all for the rest of this
+      // test — the robot never physically moves again. Stop as soon as the
+      // watchdog fires (well within watchdogTicks+2 iterations) rather than
+      // over-driving: r1 is idle again immediately after recovery, so
+      // continuing to tick past that point would let runDispatch()
+      // legitimately re-assign the very same (now re-queued) order right
+      // back to it, which would itself go on to re-trip its OWN fresh
+      // watchdog clock later — a correct but irrelevant second event this
+      // test isn't about.
+      let watchdogFired = false;
+      for (let i = 0; i < 10 && !watchdogFired; i++) {
+        orch.tickOnce();
+        watchdogFired = orch
+          .getAlarms()
+          .some((a) => a.includes("no physical progress") && a.includes("r1"));
+      }
+
+      expect(watchdogFired).toBe(true);
+      expect(orch.getAlarms().some((a) => a.includes("— requeueing order"))).toBe(false);
+
+      // Minor: pin the threshold itself, not just "eventually fires" — the
+      // leg was created at tick 2 (registration tick 1, dispatch tick 2,
+      // lastProgressTick = 2), so with watchdogTicks: 8 the earliest
+      // possible firing tick is 2 + 8 = 10. Allow ±1 for pipeline-ordering
+      // slack rather than pinning the exact internal tick-counting model.
+      const watchdogAlarm = orch
+        .getAlarms()
+        .find((a) => a.includes("no physical progress") && a.includes("r1"))!;
+      const tickMatch = watchdogAlarm.match(/^t=(\d+)/);
+      expect(tickMatch).not.toBeNull();
+      const firedAtTick = Number(tickMatch![1]);
+      expect(firedAtTick).toBeGreaterThanOrEqual(9);
+      expect(firedAtTick).toBeLessThanOrEqual(11);
+
+      const after = orch.snapshot().orders.find((o) => o.id === order.id)!;
+      expect(after.status).toBe("queued");
+      expect(after.retries).toBeGreaterThanOrEqual(1);
+
+      expect(adapter.cancelCalls).toContain("r1");
+      const r1 = orch.snapshot().robots.find((r) => r.id === "r1")!;
+      expect(r1.status).toBe("IDLE");
+      expect(orch._reservationOwner(cellKey(r1.pos))).toBe("r1");
+    });
+
+    it("IMPORTANT regression: an offline robot's stall is left to the offline-timeout path, not the watchdog", () => {
+      // Review finding (Important 2): with no rt.online gate, a robot whose
+      // offlineGraceMs (wall-clock) outlasts watchdogTicks*tickMs would get
+      // its leg cleared and order requeued by THIS watchdog first, under a
+      // misleading "no physical progress" alarm that never mentions the
+      // robot is actually unreachable — and hand it back into the dispatch
+      // pool as if healthy. Verify both halves: (1) while offline, with a
+      // very long offlineGraceMs (never reached in this test), the watchdog
+      // must stay completely silent no matter how many ticks pass; (2) once
+      // back online, the SAME still-frozen robot is fair game again and the
+      // watchdog fires normally.
+      const map = grid(3);
+      const adapter = new ScriptableAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      const clock = fakeClock();
+      const orch = new Orchestrator(map, adapter, {
+        now: clock.now,
+        watchdogTicks: 8,
+        blockedTicksLimit: 30,
+        offlineGraceMs: 1_000_000, // effectively never, for this test
+      });
+      adapter.tick();
+      orch.tickOnce();
+      const order = orch.submitOrder("n0_0", "n2_2");
+      orch.tickOnce(); // dispatch: pick leg created
+
+      adapter.setConnection("r1" as RobotId, false);
+      orch.tickOnce(); // processes the connection event -> rt.online = false
+
+      // Frozen AND offline for well past watchdogTicks: must stay silent.
+      for (let i = 0; i < 20; i++) orch.tickOnce();
+      expect(orch.getAlarms().some((a) => a.includes("no physical progress"))).toBe(false);
+      expect(orch.snapshot().orders.find((o) => o.id === order.id)?.status).toBe("dispatched");
+
+      // Reconnect: still frozen (no adapter.tick() call resumes), so the
+      // watchdog — now eligible again — should fire shortly after.
+      adapter.setConnection("r1" as RobotId, true);
+      let watchdogFired = false;
+      for (let i = 0; i < 10 && !watchdogFired; i++) {
+        orch.tickOnce();
+        watchdogFired = orch
+          .getAlarms()
+          .some((a) => a.includes("no physical progress") && a.includes("r1"));
+      }
+      expect(watchdogFired).toBe(true);
+    });
+
+    it("IMPORTANT round-2 regression: reconnecting after an outage longer than watchdogTicks grants a fresh window instead of instant-firing", () => {
+      // Review round-2 finding: the #15 gate on rt.online stops the CHECK
+      // from evaluating while offline, but tickCount keeps advancing the
+      // whole time regardless of connectivity, and leg.lastProgressTick was
+      // never refreshed on reconnect. A robot offline for LONGER than
+      // watchdogTicks (but shorter than offlineGraceMs, so
+      // handleOfflineTimeouts() never claims it first) would, pre-fix, have
+      // the gate lifted back on the very first post-reconnect tick with an
+      // already-expired clock — firing before the robot could report so
+      // much as one tick of real movement. Fixed: the "connection" event
+      // handler refreshes lastProgressTick (and offWindowTicks) to the
+      // current tick on an offline->online transition.
+      const map = grid(5);
+      const adapter = new FakeAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      const orch = new Orchestrator(map, adapter, {
+        watchdogTicks: 5,
+        blockedTicksLimit: 30,
+        offlineGraceMs: 10_000_000, // never reached in this test
+      });
+      adapter.tick();
+      orch.tickOnce();
+      const order = orch.submitOrder("n4_0", "n0_0");
+      orch.tickOnce(); // dispatch: pick leg created
+
+      adapter.setConnection("r1" as RobotId, false);
+      orch.tickOnce(); // processes the connection event -> rt.online = false
+
+      // Stay offline for well longer than watchdogTicks (5) — the
+      // orchestrator keeps ticking (tickCount keeps advancing) throughout;
+      // only the #14/#15 CHECK is suppressed by the rt.online gate.
+      for (let i = 0; i < 12; i++) orch.tickOnce();
+      expect(orch.getAlarms().some((a) => a.includes("no physical progress"))).toBe(false);
+
+      // Reconnect. Pre-fix, this single tick alone (tickCount already far
+      // past lastProgressTick + watchdogTicks, using the STALE
+      // pre-outage lastProgressTick) would fire the watchdog immediately,
+      // right here, before the robot ever got a chance to move again.
+      adapter.setConnection("r1" as RobotId, true);
+      orch.tickOnce();
+      expect(orch.getAlarms().some((a) => a.includes("no physical progress"))).toBe(false);
+
+      // Next ticks make real progress; the order completes normally with no
+      // watchdog alarm ever firing.
+      let completed = false;
+      for (let i = 0; i < 60 && !completed; i++) {
+        step(orch, adapter);
+        completed = orch.snapshot().orders.find((o) => o.id === order.id)?.status === "completed";
+      }
+      expect(completed).toBe(true);
+      expect(orch.getAlarms().some((a) => a.includes("no physical progress"))).toBe(false);
+    });
+
+    it("IMPORTANT regression: a genuinely blocked leg is resolved by the backstop before the watchdog ever fires", () => {
+      // Review finding (Important 3): the watchdogTicks > blockedTicksLimit
+      // interaction must be proven with a real run, not assumed. 3x1
+      // corridor deadlock — same shape as the "sustained reservation
+      // contention requeues the order (deadlock backstop)" test above — r2
+      // permanently parks mid-corridor, blocking r1's only route. Yield
+      // dispatch disabled (yieldAfterTicks: 999, far above
+      // blockedTicksLimit) so only the backstop and the watchdog are in
+      // play. Scaled-down but ratio-preserving thresholds
+      // (blockedTicksLimit 5, watchdogTicks 10 — production default ratio
+      // is 20:40, i.e. 1:2) so the run converges quickly while still
+      // exercising several backstop-requeue/redispatch cycles, each
+      // re-creating a FRESH leg (fresh lastProgressTick) well inside
+      // blockedTicksLimit every time — the watchdog must never get the
+      // chance, on any single leg incarnation, to accumulate anywhere near
+      // its own larger threshold, even though the run's TOTAL elapsed
+      // ticks comfortably exceeds watchdogTicks several times over.
+      const map = WarehouseMap.fromJSON(WarehouseMap.grid(3, 1));
+      const adapter = new FakeAdapter(
+        [
+          { id: "r1" as RobotId, startNodeId: "n0_0" },
+          { id: "r2" as RobotId, startNodeId: "n1_0" },
+        ],
+        map
+      );
+      const orch = new Orchestrator(map, adapter, {
+        horizon: 3,
+        blockedTicksLimit: 5,
+        watchdogTicks: 10,
+        yieldAfterTicks: 999,
+      });
+      adapter.tick();
+      orch.tickOnce();
+      const order = orch.submitOrder("n2_0", "n0_0");
+
+      // Same tick-driving strategy as the pre-existing deadlock-backstop
+      // test (see its own comment for the full rationale): pair ticks only
+      // while the order is NOT "underway" (physical movement genuinely
+      // needed for the pick leg / any post-requeue re-pick), then
+      // orchestrator-only ticks once "underway" so the robot never
+      // physically catches up to finish a stale short mission early and
+      // blockedTicks is free to climb to the backstop's limit.
+      let terminal = false;
+      for (let i = 0; i < 300 && !terminal; i++) {
+        const status = orch.snapshot().orders.find((o) => o.id === order.id)?.status;
+        if (status === "underway") {
+          orch.tickOnce();
+        } else {
+          adapter.tick();
+          orch.tickOnce();
+        }
+        terminal = orch.snapshot().orders.find((o) => o.id === order.id)?.status === "failed";
+      }
+      expect(terminal).toBe(true);
+      expect(orch.getAlarms().some((a) => a.includes("— requeueing order"))).toBe(true);
+      expect(orch.getAlarms().some((a) => a.includes("no physical progress"))).toBe(false);
+      expect(orch.getAlarms().some((a) => a.includes("off committed path"))).toBe(false);
+    });
+
+    it("normal slow progress does not trip the watchdog", () => {
+      // adapter.tick() every 3rd orchestrator tick, watchdogTicks 8: order
+      // completes, no watchdog alarm (each progress event resets the clock).
+      const map = grid(4);
+      const adapter = new FakeAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      const orch = new Orchestrator(map, adapter, { watchdogTicks: 8 });
+      adapter.tick();
+      orch.tickOnce();
+      const order = orch.submitOrder("n0_3", "n3_0");
+
+      let completed = false;
+      for (let i = 0; i < 200 && !completed; i++) {
+        if (i % 3 === 0) adapter.tick();
+        orch.tickOnce();
+        completed = orch.snapshot().orders.find((o) => o.id === order.id)?.status === "completed";
+      }
+      expect(completed).toBe(true);
+      expect(orch.getAlarms().some((a) => a.includes("no physical progress"))).toBe(false);
+    });
+
+    it("review round 3: a frozen robot recovered by the watchdog is not instantly re-dispatched while a healthy robot is idle", () => {
+      // Without a post-watchdog cooldown, the just-recovered robot reports
+      // no leg and no bad status — nothing else excludes it from the idle
+      // pool — so Hungarian, being distance-greedy, re-picks it right back
+      // (it's sitting exactly where the order needs a robot from). It would
+      // then re-stall the SAME way, burning the order's whole 3-retry cap
+      // in about 3x watchdogTicks while r2 sits idle the entire time. Same
+      // "pickup = robot's own cell, never call adapter.tick() again" setup
+      // as the very first watchdog test above (frontier === goal from
+      // creation, so extension is never attempted and blockedTicks never
+      // moves off 0) — but with a second, healthy robot present throughout.
+      const map = grid(3);
+      const adapter = new ScriptableAdapter(
+        [
+          { id: "r1" as RobotId, startNodeId: "n0_0" },
+          { id: "r2" as RobotId, startNodeId: "n2_2" },
+        ],
+        map
+      );
+      const orch = new Orchestrator(map, adapter, { watchdogTicks: 8, blockedTicksLimit: 30 });
+      adapter.tick();
+      orch.tickOnce(); // registers both r1 and r2
+      const order = orch.submitOrder("n0_0", "n1_1"); // pickup = r1's own cell -> r1 wins (distance 0)
+      orch.tickOnce(); // dispatch: r1's pick leg created (frontier === goal already), sent once
+
+      expect(orch.snapshot().orders.find((o) => o.id === order.id)?.robotId).toBe("r1");
+
+      // Freeze entirely: no adapter.tick() at all — r1 never reports
+      // progress, r2 never needs to (it has no leg yet).
+      let watchdogFired = false;
+      for (let i = 0; i < 10 && !watchdogFired; i++) {
+        orch.tickOnce();
+        watchdogFired = orch
+          .getAlarms()
+          .some((a) => a.includes("no physical progress") && a.includes("r1"));
+      }
+      expect(watchdogFired).toBe(true);
+
+      // The requeue only becomes visible to runDispatch() on the NEXT tick
+      // (recovery happens in runRouting(), pipeline step 5, AFTER
+      // runDispatch()'s step 4 already ran this same tick). One more tick:
+      // r1 is healthy-looking (no leg, no bad status) but must be skipped
+      // for being in its post-watchdog cooldown window; r2 — untouched,
+      // genuinely idle the whole time — must be the one Hungarian picks.
+      orch.tickOnce();
+      const reassigned = orch.snapshot().orders.find((o) => o.id === order.id)!;
+      expect(reassigned.robotId).toBe("r2");
+      expect(reassigned.status).toBe("dispatched");
+      // Exactly the one watchdog-triggered requeue so far — nowhere near
+      // OrderBook's 3-retry fail cap.
+      expect(reassigned.retries).toBe(1);
+
+      // Resume physical ticking so r2 can actually walk the order home; r1
+      // must never be re-selected (it's cooling, and r2 is already holding
+      // the only pending order).
+      let completed = false;
+      for (let i = 0; i < 60 && !completed; i++) {
+        adapter.tick();
+        orch.tickOnce();
+        completed = orch.snapshot().orders.find((o) => o.id === order.id)?.status === "completed";
+      }
+      expect(completed).toBe(true);
+      const final = orch.snapshot().orders.find((o) => o.id === order.id)!;
+      expect(final.robotId).toBe("r2");
+      expect(final.retries).toBe(1);
+      expect(final.status).not.toBe("failed");
+    });
+  });
+
+  describe("growth hygiene: alarm ring buffer (#8)", () => {
+    it("alarm log is capped and reports how many were dropped", () => {
+      // Bare 3x1 corridor, r2 idle-parked at n1_0 (see the dedicated "3x1
+      // corridor with no side-step cell" yield test above): there is no
+      // side-step cell for r2 to yield into and no alternate route around
+      // it, so r1's drop leg (n0_0 -> n2_0) is permanently blocked and
+      // "contention: ... no forward candidate" fires exactly once per
+      // orchestrator tick, forever, with nothing to ever resolve it.
+      // blockedTicksLimit is set far above this test's own tick budget so
+      // the deadlock backstop never fires and requeues/resets the leg —
+      // the alarm stream just keeps climbing, which is exactly the
+      // unbounded-growth condition pushAlarm()'s cap exists to guard
+      // against.
+      const map = WarehouseMap.fromJSON(WarehouseMap.grid(3, 1));
+      const adapter = new FakeAdapter(
+        [
+          { id: "r1" as RobotId, startNodeId: "n0_0" },
+          { id: "r2" as RobotId, startNodeId: "n1_0" },
+        ],
+        map
+      );
+      const orch = new Orchestrator(map, adapter, {
+        horizon: 3,
+        yieldAfterTicks: 3,
+        blockedTicksLimit: 10_000,
+      });
+      adapter.tick();
+      orch.tickOnce();
+      orch.submitOrder("n0_0", "n2_0");
+
+      for (let i = 0; i < 600; i++) {
+        adapter.tick();
+        orch.tickOnce();
+      }
+
+      const alarms = orch.getAlarms();
+      // Cap (500) plus at most one synthetic "dropped" head line.
+      expect(alarms.length).toBeLessThanOrEqual(501);
+      expect(alarms[0]).toMatch(/^\(\d+ older alarms dropped\)$/);
+    });
+  });
+
+  describe("review round 3 (minor 6): config sanity alarms", () => {
+    it("warns (does not throw, does not clamp) when watchdogTicks <= blockedTicksLimit", () => {
+      const map = grid(3);
+      const adapter = new FakeAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      expect(() => new Orchestrator(map, adapter, { watchdogTicks: 10, blockedTicksLimit: 10 })).not.toThrow();
+      const orch = new Orchestrator(map, adapter, { watchdogTicks: 10, blockedTicksLimit: 10 });
+      expect(
+        orch.getAlarms().some((a) => a.includes("watchdogTicks") && a.includes("<=") && a.includes("blockedTicksLimit"))
+      ).toBe(true);
+    });
+
+    it("warns when yieldAfterTicks >= blockedTicksLimit", () => {
+      const map = grid(3);
+      const adapter = new FakeAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      const orch = new Orchestrator(map, adapter, { yieldAfterTicks: 20, blockedTicksLimit: 20 });
+      expect(
+        orch.getAlarms().some((a) => a.includes("yieldAfterTicks") && a.includes(">=") && a.includes("blockedTicksLimit"))
+      ).toBe(true);
+    });
+
+    it("stays silent (no config alarms) for a sanely-configured orchestrator", () => {
+      const map = grid(3);
+      const adapter = new FakeAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      const orch = new Orchestrator(map, adapter, {
+        yieldAfterTicks: 6,
+        blockedTicksLimit: 20,
+        watchdogTicks: 40,
+      });
+      expect(orch.getAlarms().some((a) => a.includes("config:"))).toBe(false);
+    });
+
+    it("does not clamp the configured values — the orchestrator still runs with the (silly) config as given", () => {
+      const map = grid(3);
+      const adapter = new FakeAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      const orch = new Orchestrator(map, adapter, {
+        watchdogTicks: 1,
+        blockedTicksLimit: 20,
+        yieldAfterTicks: 20,
+      });
+      adapter.tick();
+      orch.tickOnce();
+      const order = orch.submitOrder("n2_2", "n0_0");
+      // Merely proving the orchestrator remains usable (doesn't throw, does
+      // real work) under an out-of-order config — not asserting which
+      // mechanism wins, that's covered by the dedicated watchdog-vs-backstop
+      // ordering tests elsewhere.
       let completed = false;
       for (let i = 0; i < 60 && !completed; i++) {
         adapter.tick();

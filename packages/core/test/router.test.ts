@@ -363,3 +363,25 @@ describe("boundary-corridor livelock regression (P1)", () => {
     expect(reachedAt).toBeLessThanOrEqual(40);
   });
 });
+
+describe("PibtRouter priorities prune (#8)", () => {
+  it("priority state for vanished agents is pruned", () => {
+    const map = WarehouseMap.grid(4, 4);
+    const router = new PibtRouter(WarehouseMap.fromJSON(map));
+    const a: Agent = { id: "a" as RobotId, at: "n0_0", goal: "n3_3", priority: 0 };
+    const b: Agent = { id: "b" as RobotId, at: "n3_0", goal: "n0_3", priority: 0 };
+    const c: Agent = { id: "c" as RobotId, at: "n0_3", goal: "n3_0", priority: 0 };
+
+    router.step([a, b, c]);
+    expect(router._prioritySize()).toBe(3);
+
+    // c vanishes from the fleet (e.g. offline/removed) — every subsequent
+    // step only ever sees [a, b]. Priority state for c must be pruned, not
+    // retained forever: assert the live count matches the CURRENT agent
+    // set after each step, not just once.
+    for (let i = 0; i < 5; i++) {
+      router.step([a, b]);
+      expect(router._prioritySize()).toBe(2);
+    }
+  });
+});

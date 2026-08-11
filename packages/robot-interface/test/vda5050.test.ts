@@ -224,6 +224,44 @@ describe("Vda5050Adapter", () => {
   );
 
   it(
+    "stop() clears per-robot tracking state (#8)",
+    async () => {
+      // Slow vehicle speed so the order is still live (not yet completed)
+      // when we snapshot _trackingSizes() before stop() — orders/
+      // attemptCounters/last-node/last-pos tracking all populate as soon as
+      // sendMission() is called and at least one heartbeat lands, and
+      // orders/missionDone would otherwise self-clear the `orders` entry
+      // before we get to observe it non-empty.
+      const rig = await buildRig({ vehicleSpeed: 0.2 });
+      try {
+        const mission: Mission = { id: "m1", robotId: "sim-001", nodeIds: ["n0", "n1", "n2"] };
+        await rig.adapter.sendMission(mission, rig.map);
+
+        await waitFor(() => rig.events.some((e) => e.type === "state"), 10_000);
+
+        const before = rig.adapter._trackingSizes();
+        expect(before.orders).toBeGreaterThan(0);
+        expect(before.attemptCounters).toBeGreaterThan(0);
+        expect(before.lastNodeIdByRobot).toBeGreaterThan(0);
+        expect(before.lastPosByRobot).toBeGreaterThan(0);
+
+        await rig.adapter.stop();
+
+        expect(rig.adapter._trackingSizes()).toEqual({
+          orders: 0,
+          attemptCounters: 0,
+          lastNodeIdByRobot: 0,
+          lastPosByRobot: 0,
+          warnedUnknownRobots: 0,
+        });
+      } finally {
+        await rig.close();
+      }
+    },
+    25_000
+  );
+
+  it(
     "emits a connection offline event when the AGV disconnects",
     async () => {
       const rig = await buildRig();

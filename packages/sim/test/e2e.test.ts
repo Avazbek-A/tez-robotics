@@ -309,13 +309,20 @@ describe.sequential("sim fleet E2E soak (packages/sim)", () => {
         // the correct regression gate.
         expect(collisions.sustained, collisions.sustained.join("\n")).toEqual([]);
 
-        // Completion-rate gate — raised to 95%, the floor the fix in
-        // commits 30355ee/a808916 (Task 2, horizon-gated frontier planning
-        // + blocking reservations + deadlock backstop) restores. The prior
-        // 90% "honest" threshold existed only to tolerate the mission-
-        // extension-flood mechanism documented in `seededOrderSpecs`'s doc
-        // comment above, which that fix eliminates.
-        expect(completionRate, `completion rate ${(completionRate * 100).toFixed(1)}% (${completedCount}/${ORDER_COUNT})`).toBeGreaterThanOrEqual(0.95);
+        // Completion-rate gate — raised to 100%, from the prior 95% floor.
+        // The 95% floor tolerated the single parked-idle-robot casualty
+        // documented in docs/BACKLOG.md item #13 (an order permanently
+        // blocked by a parked robot never itself dispatched out of the
+        // way). That was FIXED via yield-leg dispatch (commits `434722d`,
+        // `8c51327`, pre-pilot-hardening Task 1): a blocked order leg now
+        // triggers a BFS-routed yield move for the blocking robot instead
+        // of stalling until the deadlock backstop requeues (and eventually
+        // fails) the order. Two consecutive full acceptance runs post-fix
+        // both landed 20/20 (100.0%), zero sustained collisions, zero
+        // requeue/backstop alarms attributable to parked robots — see
+        // task-5-report.md for the numbers and alarm histograms. Never
+        // lower this back down without a documented regression.
+        expect(completionRate, `completion rate ${(completionRate * 100).toFixed(1)}% (${completedCount}/${ORDER_COUNT})`).toBeGreaterThanOrEqual(1.0);
 
         expect(finalSnap.kpis.ordersPerHour).toBeGreaterThan(0);
         expect(finalSnap.kpis.utilization).toBeGreaterThanOrEqual(0);
