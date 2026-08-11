@@ -8,19 +8,28 @@
 
 | Module | Status | Description |
 |---|---|---|
-| [`orchestrator-demo/`](orchestrator-demo/) | ✅ working demo | Fleet orchestration simulation: task allocation, A* routing, conflict resolution, charging management, live KPI dashboard (RU/UZ/EN) |
+| [`packages/`](packages/) | ✅ v1 core, tested | **Tez Orchestrator** — production-grade fleet orchestration platform: VDA 5050 over MQTT, multi-robot routing (PIBT), cell-reservation traffic safety, Hungarian dispatch, order lifecycle with retry/failure recovery, simulated fleet speaking the real protocol |
+| [`orchestrator-demo/`](orchestrator-demo/) | ✅ browser demo | Visual warehouse simulation: task allocation, routing, conflict resolution, live KPI dashboard (RU/UZ/EN) |
 | `safety-cv/` | in development | Computer-vision safety module on existing CCTV: PPE compliance, hazard zones, forklift–pedestrian proximity |
 | `1c-connector/` | planned | Native 1C integration layer — order intake and inventory sync for the orchestrator |
 
-## Orchestrator demo
+## Tez Orchestrator (`packages/`)
 
-Warehouse simulation demonstrating the software layer we build on top of series-production AMRs:
+TypeScript monorepo implementing the real orchestration layer — robots connect as external clients over **VDA 5050 2.0 / MQTT**, so a physical AMR plugs in with zero core changes:
 
-- **Task allocation** — cost-based dispatcher assigns incoming 1C/WMS orders to the nearest available robot
-- **Routing** — A* pathfinding with cell-reservation conflict resolution between robots
-- **Fleet management** — battery model, automatic charging, per-robot state tracking
-- **Live KPIs** — orders/hour, average cycle time, fleet utilization, distance traveled, staff walking saved
-- **Trilingual UI** — Russian, Uzbek, English
+- **`@tez/core`** — warehouse map graph, PIBT multi-robot router (scales to 1000+ agents, deadlock-resolving), cell-reservation table, Hungarian assignment dispatcher, transport-order state machine
+- **`@tez/robot-interface`** — protocol-agnostic adapter seam + real VDA 5050 adapter (built on the MIT-licensed Siemens `vda-5050-lib`); adapter architecture ready for vendor-specific protocols
+- **`@tez/orchestrator`** — the control loop: dispatch → route → reserve → execute, offline-robot recovery, quarantine, live KPIs
+- **`@tez/sim`** — simulated AMR fleet speaking real VDA 5050 over a real broker, failure-injection end-to-end soak tests
+
+149 tests including multi-minute fleet soaks with robot-failure injection. Known v1 limits are documented in [`docs/BACKLOG.md`](docs/BACKLOG.md).
+
+```bash
+corepack pnpm install
+corepack pnpm -r test        # full suite incl. e2e soak (~10 min, serialized)
+```
+
+## Browser demo (`orchestrator-demo/`)
 
 ```bash
 cd orchestrator-demo
