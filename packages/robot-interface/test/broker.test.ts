@@ -1,6 +1,6 @@
 import { describe, it, beforeAll, afterAll } from 'vitest';
 import * as mqtt from 'mqtt';
-import { startDevBroker, type DevBrokerResult } from '../src/dev-broker';
+import { startDevBroker, type DevBrokerResult } from '../src/dev-broker.js';
 
 const EXTERNAL_MQTT_URL = process.env.MQTT_URL || 'mqtt://localhost:1883';
 const CONNECT_TIMEOUT = 500;

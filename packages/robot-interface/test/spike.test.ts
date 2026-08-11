@@ -100,7 +100,7 @@ import {
   type AgvId,
   type ClientOptions,
 } from 'vda-5050-lib';
-import { startDevBroker, type DevBrokerResult } from '../src/dev-broker';
+import { startDevBroker, type DevBrokerResult } from '../src/dev-broker.js';
 
 describe('vda-5050-lib protocol spike: master <-> virtual AGV order roundtrip', () => {
   let devBroker: DevBrokerResult;

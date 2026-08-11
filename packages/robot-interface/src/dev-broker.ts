@@ -1,6 +1,7 @@
 import http from 'http';
 import net from 'net';
-import aedes from 'aedes';
+import type { Duplex } from 'node:stream';
+import { createBroker } from 'aedes';
 import wsStream from 'websocket-stream';
 
 export interface DevBrokerResult {
@@ -58,12 +59,22 @@ export async function startDevBroker(opts?: DevBrokerOptions): Promise<DevBroker
   const targetPort = opts?.port ?? 1883;
   const targetWsPort = opts?.wsPort ?? 9001;
 
-  const broker = aedes();
+  const broker = createBroker();
   const mqttServer = net.createServer(broker.handle);
   const wsHttpServer = http.createServer();
 
-  // Use websocket-stream to properly bridge WebSocket to MQTT protocol
-  wsStream.createServer({ server: wsHttpServer }, (stream) => {
+  // Use websocket-stream to properly bridge WebSocket to MQTT protocol.
+  // NOTE: websocket-stream's own .d.ts types `createServer`'s 2nd arg as a
+  // no-arg `() => void` "listening" callback, but its actual runtime
+  // implementation (server.js) registers whatever's passed there as the
+  // 'stream' event listener instead — i.e. this callback DOES receive the
+  // bridged Duplex stream, the type declaration is just wrong. Registering
+  // via `.on('stream', ...)` directly (rather than passing the callback
+  // into createServer) sidesteps that inaccurate signature while producing
+  // the exact same runtime behavior, since createServer's own callback
+  // handling is implemented as nothing more than `this.on('stream', cb)`.
+  const wsServer = wsStream.createServer({ server: wsHttpServer });
+  wsServer.on('stream', (stream: Duplex) => {
     broker.handle(stream);
   });
 
@@ -91,9 +102,10 @@ export async function startDevBroker(opts?: DevBrokerOptions): Promise<DevBroker
                 reject(err2);
                 return;
               }
-              broker.close((err3) => {
-                if (err3) reject(err3);
-                else resolve();
+              // aedes's close() callback is `() => void` — no error
+              // parameter (unlike net.Server/http.Server's close above).
+              broker.close(() => {
+                resolve();
               });
             });
           });
