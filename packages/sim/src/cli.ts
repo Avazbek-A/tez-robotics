@@ -18,6 +18,13 @@ function requireValue(argv: string[], i: number, flag: string): string {
   if (value === undefined) {
     throw new Error(`${flag} requires a value`);
   }
+  // A value that itself looks like a flag almost always means the real
+  // value was left off (e.g. `--map --robots 10`), not that "--robots" is
+  // a genuine map path — fail with a clear message instead of silently
+  // consuming the next flag as this one's value.
+  if (value.startsWith("--")) {
+    throw new Error(`${flag} requires a value, got flag-like "${value}" instead`);
+  }
   return value;
 }
 

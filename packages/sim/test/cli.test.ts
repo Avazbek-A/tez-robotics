@@ -80,6 +80,10 @@ describe("sim CLI arg parsing (hand-rolled, no yargs dep)", () => {
     ).toThrow(/--vda-version must be one of/);
   });
 
+  it("throws a clear error when a flag's value is missing and the next token is itself a flag", () => {
+    expect(() => parseArgs(["--map", "--robots", "10"])).toThrow(/--map requires a value, got flag-like "--robots"/);
+  });
+
   it("throws on an unknown flag", () => {
     expect(() => parseArgs(["--bogus", "x"])).toThrow(/unknown argument/);
   });

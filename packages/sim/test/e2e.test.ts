@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { WarehouseMap } from "@tez/core";
 import { Orchestrator } from "@tez/orchestrator";
-import { startDevBroker, Vda5050Adapter, type DevBrokerResult, type AdapterEvent } from "@tez/robot-interface";
+import { startDevBroker, Vda5050Adapter, type DevBrokerResult } from "@tez/robot-interface";
 import { spawnFleet, type SpawnedFleet } from "../src/fleet.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -477,9 +477,22 @@ describe.sequential("sim fleet E2E soak (packages/sim)", () => {
         ).toBeGreaterThanOrEqual(0.7);
 
         // "requeued not lost": any order ever actively held by the killed
-        // robot must have reached a terminal state (already guaranteed by
-        // allTerminal above) via the offline-timeout requeue path actually
-        // firing — not by coincidentally never being touched again.
+        // robot must end EITHER terminal (completed/failed/canceled) OR
+        // genuinely re-bound to a DIFFERENT, live robot (robotId !== the
+        // killed id, with status "dispatched" or "underway" — both of
+        // which are only reachable via `OrderBook.assign()`/a completed
+        // pick leg, i.e. real dispatch/motion evidence, not a leftover
+        // stale robotId). NOTE: `allTerminal` above is only a WARNING, not
+        // a guarantee — a genuine, non-transient reservation deadlock (see
+        // Finding 1-3 in task-12-report.md) can leave an order "underway"
+        // forever with a perfectly legitimate, non-killed robot; that
+        // general failure mode is caught by the completion-rate gate
+        // above, not by this order-identity-specific check. This check's
+        // job is narrower and more precise: catch the killed robot's order
+        // actually being LOST — e.g. left permanently "queued" (freed but
+        // never re-dispatched to anyone) or still carrying the killed
+        // robot's id — which a blanket `.not.toBe("dispatched")` check
+        // would silently let through.
         if (everOnKilledRobot.size > 0) {
           expect(
             sawOfflineRequeue,
@@ -487,10 +500,19 @@ describe.sequential("sim fleet E2E soak (packages/sim)", () => {
           ).toBe(true);
           for (const orderId of everOnKilledRobot) {
             const finalOrder = finalSnap.orders.find((o) => o.id === orderId);
+            const isTerminal =
+              finalOrder?.status === "completed" ||
+              finalOrder?.status === "failed" ||
+              finalOrder?.status === "canceled";
+            const isReboundToLiveRobot =
+              !isTerminal &&
+              finalOrder?.robotId !== undefined &&
+              finalOrder.robotId !== KILL_ROBOT &&
+              (finalOrder.status === "dispatched" || finalOrder.status === "underway");
             expect(
-              finalOrder?.status,
-              `order ${orderId} was held by killed robot ${KILL_ROBOT} but ended in status ${finalOrder?.status}`
-            ).not.toBe("dispatched");
+              isTerminal || isReboundToLiveRobot,
+              `order ${orderId} was held by killed robot ${KILL_ROBOT} but ended in status ${finalOrder?.status} robotId=${finalOrder?.robotId} — neither terminal nor genuinely rebound to a different live robot`
+            ).toBe(true);
           }
         }
       } finally {
