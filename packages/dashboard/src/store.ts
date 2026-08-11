@@ -43,6 +43,9 @@ export const fleetStore: StoreApi<FleetState> = createStore<FleetState>((set, ge
   selectedRobotId: undefined,
   applyFrame: (f) => {
     const now = Date.now();
+    // Full array copy every frame (currently ~10Hz): fine at the 600-sample
+    // cap this is bounded to — revisit with a ring buffer only if profiling
+    // actually flags this allocation, not preemptively.
     const nextBuffer = [...get().kpiBuffer, { t: now, kpis: f.kpis }];
     if (nextBuffer.length > KPI_BUFFER_CAP) nextBuffer.splice(0, nextBuffer.length - KPI_BUFFER_CAP);
     set({ frame: f, lastFrameAt: now, kpiBuffer: nextBuffer });

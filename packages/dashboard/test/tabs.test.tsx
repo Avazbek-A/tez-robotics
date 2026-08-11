@@ -1,11 +1,30 @@
+import { cloneElement, isValidElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useI18n } from "../src/i18n";
 import { fleetStore, KPI_BUFFER_CAP } from "../src/store";
 import { OrdersTab } from "../src/tabs/OrdersTab";
 import { AnalyticsTab } from "../src/tabs/AnalyticsTab";
 import type { StateFrame, TransportOrder } from "../src/types";
+
+// recharts' `ResponsiveContainer` measures its DOM node via ResizeObserver
+// to get pixel dimensions; happy-dom has no real layout engine, so it always
+// measures 0x0 and recharts logs a "width(0) and height(0)" warning to
+// stderr on every render. That's just test-environment noise — real
+// browsers measure real dimensions fine — so it's stubbed out here to hand
+// the wrapped chart a fixed, non-zero size directly instead of measuring,
+// keeping CI/test output clean.
+vi.mock("recharts", async () => {
+  const actual = await vi.importActual<typeof import("recharts")>("recharts");
+  return {
+    ...actual,
+    ResponsiveContainer: ({ children }: { children: ReactNode }) =>
+      isValidElement(children)
+        ? cloneElement(children, { width: 400, height: 200 } as Record<string, unknown>)
+        : children,
+  };
+});
 
 function makeOrder(overrides: Partial<TransportOrder> = {}): TransportOrder {
   return {
@@ -159,6 +178,62 @@ describe("OrdersTab", () => {
     await waitFor(() => {
       expect(screen.getByText("auto-assign")).toBeInTheDocument();
     });
+  });
+
+  it("does not refetch on re-expand at the same status, but does refetch after the order's status changed", async () => {
+    const order = makeOrder({ id: "o-stale", status: "queued" });
+    fleetStore.getState().applyFrame(makeFrame([order]));
+
+    const fetchMock = vi.fn().mockImplementation(async () => ({
+      ok: true,
+      json: async () => {
+        const current = fleetStore.getState().frame?.orders[0] as TransportOrder;
+        return {
+          orders: [
+            {
+              ...current,
+              history: [
+                { id: 1, order_id: current.id, at: "2026-08-11T10:00:00Z", status: current.status, robot_id: null, note: null },
+              ],
+            },
+          ],
+        };
+      },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<OrdersTab />);
+
+    // Expand → first fetch.
+    fireEvent.click(screen.getByTestId("orders-row-o-stale"));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    // Collapse, then re-expand with no status change in between: cached,
+    // no second fetch.
+    fireEvent.click(screen.getByTestId("orders-row-o-stale"));
+    expect(screen.queryByTestId("orders-history-o-stale")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("orders-row-o-stale"));
+    await waitFor(() => expect(screen.getByTestId("orders-history-o-stale")).toBeInTheDocument());
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Collapse, the order progresses to a new status in a fresh frame, then
+    // re-expand: the stale queued-status cache entry no longer applies, so
+    // this must fetch again. The frame update is wrapped in `act` (and its
+    // effect awaited via the badge text) so the row's closure has actually
+    // picked up the new order object before the next click — otherwise the
+    // click could fire against a stale pre-update render.
+    fireEvent.click(screen.getByTestId("orders-row-o-stale"));
+    act(() => {
+      fleetStore.getState().applyFrame(
+        makeFrame([{ ...order, status: "dispatched", robotId: "r1" as TransportOrder["robotId"] }]),
+      );
+    });
+    await waitFor(() => {
+      expect(within(screen.getByTestId("orders-row-o-stale")).getByText("Dispatched")).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByTestId("orders-row-o-stale"));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
   });
 });
 

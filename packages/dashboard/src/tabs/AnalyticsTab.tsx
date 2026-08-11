@@ -147,15 +147,18 @@ export function AnalyticsTab() {
         utilizationPct: row.utilization * 100,
       }));
     }
-    const cutoff = Date.now() - RANGE_MS;
-    return kpiBuffer
-      .filter((sample) => sample.t >= cutoff)
-      .map((sample) => ({
-        t: sample.t,
-        ordersPerHour: sample.kpis.ordersPerHour,
-        avgCycleS: sample.kpis.avgCycleMs / 1000,
-        utilizationPct: sample.kpis.utilization * 100,
-      }));
+    // No `t >= cutoff` filter here: kpiBuffer is capped at KPI_BUFFER_CAP
+    // (600) samples, one per WS frame — at the server's current frame rate
+    // that's well under RANGE_MS (1 hour) of history, so a 1-hour cutoff
+    // would never actually drop anything today. Filtering by RANGE_MS would
+    // wrongly *imply* this buffer spans a full hour; it doesn't, it's just
+    // "whatever's in the ring buffer right now."
+    return kpiBuffer.map((sample) => ({
+      t: sample.t,
+      ordersPerHour: sample.kpis.ordersPerHour,
+      avgCycleS: sample.kpis.avgCycleMs / 1000,
+      utilizationPct: sample.kpis.utilization * 100,
+    }));
   }, [range, kpiBuffer]);
 
   return (

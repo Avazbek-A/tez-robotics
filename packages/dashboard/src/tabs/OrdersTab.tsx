@@ -103,13 +103,28 @@ function HistoryTimeline({
 }
 
 /**
+ * Cache key for a row's fetched history: order id + status. Keying on
+ * status (not just id) means the cache self-invalidates whenever the order
+ * progresses to a new status between expands — re-expanding after a
+ * queued→dispatched (etc.) transition triggers a fresh fetch instead of
+ * showing the stale history captured at the earlier status. Re-toggling the
+ * *same* row at its *current* status (collapse/expand without any frame
+ * update in between) still hits the cache, so that doesn't refetch.
+ */
+function historyCacheKey(order: TransportOrder): string {
+  return `${order.id}:${order.status}`;
+}
+
+/**
  * Orders tab: full order table with client-side status filter chips + id
  * search, and per-row expand into a history timeline.
  *
- * History is fetched once per expand from `GET /orders?history=1` (cached in
- * `historyCache` keyed by order id, so re-collapsing/re-expanding the same
- * row doesn't refetch). That single endpoint already covers both persistence
- * states (see packages/api/src/routes/orders.ts): with a DB it swaps in
+ * History is fetched from `GET /orders?history=1` on expand, cached in
+ * `historyCache` keyed by `historyCacheKey` (order id + status — see above)
+ * so re-collapsing/re-expanding the same row at the same status doesn't
+ * refetch, but a status change since the last expand does. That single
+ * endpoint already covers both persistence states (see
+ * packages/api/src/routes/orders.ts): with a DB it swaps in
  * `transport_order_history` rows, without one it returns orders unchanged,
  * i.e. the same in-memory `history` already sitting in the live frame. The
  * frame's `order.history` is also used directly as a fallback if the fetch
@@ -140,7 +155,8 @@ export function OrdersTab() {
       return;
     }
     setExpandedId(order.id);
-    if (historyCache[order.id]) return; // fetched once per expand — reuse the cached result
+    const cacheKey = historyCacheKey(order);
+    if (historyCache[cacheKey]) return; // already fetched at this order+status — reuse it
 
     setLoadingId(order.id);
     try {
@@ -148,11 +164,11 @@ export function OrdersTab() {
       if (!res.ok) throw new Error(`GET /orders?history=1 failed: ${res.status}`);
       const data = (await res.json()) as OrdersHistoryResponse;
       const found = data.orders.find((o) => o.id === order.id);
-      setHistoryCache((prev) => ({ ...prev, [order.id]: found?.history ?? order.history }));
+      setHistoryCache((prev) => ({ ...prev, [cacheKey]: found?.history ?? order.history }));
     } catch {
       // Persistence off, or the fetch failed outright: fall back to the
       // order's own in-memory history, already present in the live frame.
-      setHistoryCache((prev) => ({ ...prev, [order.id]: order.history }));
+      setHistoryCache((prev) => ({ ...prev, [cacheKey]: order.history }));
     } finally {
       setLoadingId(undefined);
     }
@@ -229,7 +245,7 @@ export function OrdersTab() {
                 order={order}
                 expanded={expandedId === order.id}
                 onToggle={() => toggleExpand(order)}
-                historyEntries={historyCache[order.id]}
+                historyEntries={historyCache[historyCacheKey(order)]}
                 loading={loadingId === order.id}
                 t={t}
               />
