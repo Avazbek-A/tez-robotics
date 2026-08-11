@@ -27,6 +27,13 @@ export interface OrchestratorOpts {
    * yield mission to a parked idle robot standing in its way, well before
    * the deadlock backstop (blockedTicksLimit) gives up on the order.
    * Default 6.
+   *
+   * Effectively DISABLES yield dispatch when set to 0 (blockedTicks is
+   * always incremented to at least 1 before the `=== yieldAfterTicks` check
+   * ever runs, so 0 can never match) or to any value >= blockedTicksLimit
+   * (the deadlock backstop always fires first and clears the leg before
+   * blockedTicks could climb that high) — both degrade cleanly to pre-#13
+   * backstop-only behavior, never worse.
    */
   yieldAfterTicks?: number;
   /**
@@ -459,16 +466,28 @@ export class Orchestrator {
     const rt = this.robots.get(robotId);
     if (!rt) return;
 
-    // #13: yield legs are handled entirely here, before parseMissionId /
-    // order-book logic — they never touch the order book at all. A yield
-    // missionId is `yield:${robotId}#${counter}`, which parseMissionId
-    // would reject anyway (no trailing ":pick"/":drop"), but intercepting
-    // explicitly here (rather than falling through to the unparseable-id
-    // branch below) lets a completed yield clear cleanly without logging a
-    // spurious "unparseable mission id" alarm.
-    if (rt.leg?.kind === "yield") {
-      if (rt.leg.missionId === missionId) {
+    // #13: yield events are identified by MISSION-ID SHAPE (`yield:` prefix),
+    // not by the robot's CURRENT leg kind, and handled entirely here, before
+    // parseMissionId/order-book logic — they never touch the order book at
+    // all. This must be shape-based, not `rt.leg?.kind === "yield"`-based:
+    // a late/stale event for an OLD yield missionId can drain after that
+    // yield leg already completed and was superseded by a brand-new ORDER
+    // leg (robot went idle, got re-dispatched, all before the stale event
+    // arrived) — `rt.leg?.kind` would then read "order", and this check
+    // would wrongly fall through to parseMissionId ("yield:r2#1" parses to
+    // leg "r2#1", neither "pick" nor "drop", so `!parsed` — see the
+    // corresponding regression in handleMissionFailed's unparseable-id
+    // branch, which does clear rt.leg unconditionally). Only clear when the
+    // CURRENT leg is still that same yield mission; any other case
+    // (superseded, or no leg at all) is a stale report — ignore it, and
+    // critically do NOT fall through into parseMissionId/order logic.
+    if (missionId.startsWith("yield:")) {
+      if (rt.leg?.kind === "yield" && rt.leg.missionId === missionId) {
         setLeg(rt, undefined); // yield done (or harmlessly cut short)
+      } else {
+        this.alarms.push(
+          `t=${this.tickCount} stale yield missionDone from robot ${robotId} for ${missionId} — ignoring`
+        );
       }
       return;
     }
@@ -643,13 +662,27 @@ export class Orchestrator {
     const rt = this.robots.get(robotId);
     if (!rt) return;
 
-    // #13: same yield short-circuit as handleMissionDone — a failed yield
-    // never touches the order book, just clears the leg.
-    if (rt.leg?.kind === "yield") {
-      if (rt.leg.missionId === missionId) {
+    // #13: same shape-based yield short-circuit as handleMissionDone — see
+    // its comment for why this MUST be keyed on missionId shape rather than
+    // `rt.leg?.kind`. This is the branch where getting that wrong is
+    // actively destructive: a late `yield:<id>#<n>` missionFailed draining
+    // AFTER the yield leg was superseded by a new ORDER leg would otherwise
+    // fall through to the `!parsed` branch below (a "yield:" missionId
+    // never matches parseMissionId's "<orderId>:pick|drop" shape), which
+    // unconditionally does `setLeg(rt, undefined)` — silently killing the
+    // robot's live order leg while the order itself stays "dispatched"/
+    // "underway" in the book forever (robot excluded from redispatch by
+    // `!rt.leg` never re-admitting it, order never requeued because nothing
+    // called book.requeue) — a permanently hung order.
+    if (missionId.startsWith("yield:")) {
+      if (rt.leg?.kind === "yield" && rt.leg.missionId === missionId) {
         setLeg(rt, undefined);
         this.alarms.push(
           `t=${this.tickCount} yield mission failed for robot ${robotId}: ${reason}`
+        );
+      } else {
+        this.alarms.push(
+          `t=${this.tickCount} stale yield missionFailed from robot ${robotId} for ${missionId} — ignoring`
         );
       }
       return;
@@ -1114,7 +1147,7 @@ export class Orchestrator {
       ) {
         continue;
       }
-      const target = this.findYieldTarget(ownerId, blocker.currentNodeId, nodeId);
+      const target = this.findYieldTarget(ownerId, blocker.currentNodeId, nodeId, blockedLeg);
       if (target === undefined) continue;
       blocker.lastYieldTick = this.tickCount;
       this.yieldCounter++;
@@ -1140,36 +1173,68 @@ export class Orchestrator {
   /**
    * BFS from the blocker's node (depth cap 10) for the nearest node whose
    * cell is unowned (or the blocker's own), not physically occupied by any
-   * robot, and not the cell being vacated. Undefined when nothing suitable
-   * is reachable.
+   * robot, not the cell being vacated, not anywhere on the BLOCKED robot's
+   * own future route (including its ultimate goal — see below), and no
+   * CLOSER to that blocked goal than the vacated cell already was. Undefined
+   * when nothing suitable is reachable.
+   *
+   * Excluding the blocked robot's route: a candidate node here is, by
+   * definition, unreserved (nothing has claimed it yet — that's exactly why
+   * it's a candidate), so without this exclusion the search can and did
+   * (caught in review, reproduced live) land the blocker exactly on the
+   * blocked robot's own drop/pickup node, or partway down the same
+   * corridor toward it — trading one deadlock for an equivalent or worse
+   * one instead of actually clearing the path. `blockedLeg.nodeIds.slice(
+   * progressIndex)` is the robot's remaining committed path so far;
+   * `blockedLeg.goalNode` is added explicitly since the path hasn't been
+   * extended all the way to it yet in the blocked state this is called
+   * from. The distance non-decrease requirement (candidate no closer to
+   * blockedLeg.goalNode than `vacating` was) is a second, independent
+   * layer against the same failure mode for nodes NOT literally on the
+   * known route — e.g. an as-yet-unclaimed parallel corridor cell that
+   * still happens to be closer to the blocked robot's goal — steering the
+   * blocker to step ASIDE or AWAY rather than merely further down the
+   * blocked robot's own path.
    */
   private findYieldTarget(
     blockerId: RobotId,
     from: string,
-    vacating: string
+    vacating: string,
+    blockedLeg: RobotLeg
   ): string | undefined {
     const occupiedNodes = new Set<string>();
     for (const [, rt] of this.robots) {
       if (rt.currentNodeId !== undefined) occupiedNodes.add(rt.currentNodeId);
     }
+    const blockedRoute = new Set(blockedLeg.nodeIds.slice(blockedLeg.progressIndex));
+    blockedRoute.add(blockedLeg.goalNode);
+    const vacatingDistance = this.map.distance(vacating, blockedLeg.goalNode);
     const seen = new Set<string>([from]);
     let frontier = [from];
     for (let depth = 0; depth < 10; depth++) {
       const next: string[] = [];
       for (const nodeId of frontier) {
+        // Explored breadth-first through EVERY graph-adjacent node,
+        // including ones currently occupied by another robot: this loop is
+        // a graph-distance search for a landing spot, not a simulated
+        // physical route, so walking the search through an occupied node
+        // commits nothing — actual physical movement toward whatever node
+        // is ultimately returned is still gated by the ordinary
+        // reservation-claimed extension in runRouting(), same as any leg.
+        // `seen` already excludes `from` from ever being re-proposed as a
+        // neighbor of itself, so no separate `nb !== from` check is needed.
         for (const nb of this.map.neighbors(nodeId)) {
           if (seen.has(nb)) continue;
           seen.add(nb);
           const cell = cellKey(this.map.node(nb).pos);
           const ownerId = this.reservations.owner(cell);
-          if (
+          const eligible =
             nb !== vacating &&
-            nb !== from &&
+            !blockedRoute.has(nb) &&
             !occupiedNodes.has(nb) &&
-            (ownerId === undefined || ownerId === blockerId)
-          ) {
-            return nb;
-          }
+            (ownerId === undefined || ownerId === blockerId) &&
+            this.map.distance(nb, blockedLeg.goalNode) >= vacatingDistance;
+          if (eligible) return nb;
           next.push(nb);
         }
       }
