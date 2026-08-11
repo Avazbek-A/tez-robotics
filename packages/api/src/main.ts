@@ -41,6 +41,14 @@ async function buildPersistence(config: ApiConfig): Promise<Persistence | undefi
 async function main(): Promise<void> {
   const config = loadConfig(process.env);
   const system = await buildSystem(config);
+  // scripts/demo.mjs's --vda mode scans api stdout for this exact
+  // `BROKER_URL=<url>` pattern to discover the (possibly dev-broker-
+  // assigned) broker url instead of falling back to its hardcoded default
+  // after a 5s grace period (see docs/superpowers/specs/2026-08-11-cleanup-
+  // wave-design.md decision 4).
+  if (system.mode === "vda" && system.mqttUrl) {
+    console.log(`BROKER_URL=${system.mqttUrl}`);
+  }
   await system.start();
 
   const persistence = await buildPersistence(config);

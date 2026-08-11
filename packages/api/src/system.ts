@@ -16,6 +16,14 @@ export interface System {
   /** Raw {nodes,edges} map data, served verbatim by GET /map. */
   mapJson: unknown;
   mode: "demo" | "vda";
+  /**
+   * The MQTT broker url actually in use (vda mode only — either
+   * config.mqttUrl or the dev broker's own url when devBroker is set).
+   * Undefined in demo mode. Exposed so main.ts can log
+   * `BROKER_URL=<url>` for scripts/demo.mjs's discovery (see
+   * docs/superpowers/specs/2026-08-11-cleanup-wave-design.md decision 4).
+   */
+  mqttUrl?: string;
   /** demo: lockstep interval (adapter.tick() then tickOnce()); vda: orchestrator.start(). */
   start(): Promise<void>;
   /** Clears interval / stops orchestrator + closes dev broker. */
@@ -46,7 +54,7 @@ function buildDemoSystem(config: ApiConfig, map: WarehouseMap, mapJson: unknown)
     );
   }
   const initialRobots = Array.from({ length: config.robots }, (_, i) => ({
-    id: `r${i + 1}`,
+    id: `sim-${String(i + 1).padStart(3, "0")}`,
     startNodeId: DEMO_START_NODES[i]!,
   }));
   const fake = new FakeAdapter(initialRobots, map);
@@ -106,6 +114,7 @@ async function buildVdaSystem(config: ApiConfig, map: WarehouseMap, mapJson: unk
     map,
     mapJson,
     mode: "vda",
+    mqttUrl,
     async start() {
       await orchestrator.start();
     },

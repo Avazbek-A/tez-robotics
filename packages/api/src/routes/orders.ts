@@ -142,23 +142,37 @@ export async function ordersRoutes(app: FastifyInstance, opts: OrdersRouteOpts):
     }
   );
 
-  // v1: no cancel API exists on Orchestrator (OrderBook is private to it).
-  // See docs/PLAN2-HOOK-REQUESTS.md entry 1.
+  // Wired to Orchestrator.cancelOrder (see docs/PLAN2-HOOK-REQUESTS.md
+  // entry 1 — the hook it requested, now implemented). cancelOrder throws
+  // "order not found: ..." for an unknown id and "order already terminal:
+  // ..." for a terminal one; mapped to 404/409 by message prefix below.
   app.delete<{ Params: OrderIdParams }>(
     "/orders/:id",
     {
       schema: {
         params: OrderIdParams,
         response: {
-          501: ErrorResponse,
+          200: TransportOrderSchema,
+          404: ErrorResponse,
+          409: ErrorResponse,
         },
       },
     },
-    async (_request, reply) => {
-      reply.code(501);
-      return {
-        error: "cancel not supported: orchestrator exposes no cancel API (see docs/PLAN2-HOOK-REQUESTS.md)",
-      };
+    async (request, reply) => {
+      try {
+        return system.orchestrator.cancelOrder(request.params.id);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (message.startsWith("order not found: ")) {
+          reply.code(404);
+          return { error: message };
+        }
+        if (message.startsWith("order already terminal: ")) {
+          reply.code(409);
+          return { error: message };
+        }
+        throw err;
+      }
     }
   );
 }

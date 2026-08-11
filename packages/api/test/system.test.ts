@@ -14,6 +14,7 @@ describe("buildSystem demo mode", () => {
       const done = snap.orders.find((o) => o.id === order.id);
       expect(done?.status).toBe("completed");
       expect(snap.robots).toHaveLength(3);
+      expect(snap.robots.map((r) => r.id).sort()).toEqual(["sim-001", "sim-002", "sim-003"]);
     } finally {
       await sys.stop();
     }
