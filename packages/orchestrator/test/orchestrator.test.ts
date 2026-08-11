@@ -2159,6 +2159,58 @@ describe("Orchestrator", () => {
       expect(watchdogFired).toBe(true);
     });
 
+    it("IMPORTANT round-2 regression: reconnecting after an outage longer than watchdogTicks grants a fresh window instead of instant-firing", () => {
+      // Review round-2 finding: the #15 gate on rt.online stops the CHECK
+      // from evaluating while offline, but tickCount keeps advancing the
+      // whole time regardless of connectivity, and leg.lastProgressTick was
+      // never refreshed on reconnect. A robot offline for LONGER than
+      // watchdogTicks (but shorter than offlineGraceMs, so
+      // handleOfflineTimeouts() never claims it first) would, pre-fix, have
+      // the gate lifted back on the very first post-reconnect tick with an
+      // already-expired clock — firing before the robot could report so
+      // much as one tick of real movement. Fixed: the "connection" event
+      // handler refreshes lastProgressTick (and offWindowTicks) to the
+      // current tick on an offline->online transition.
+      const map = grid(5);
+      const adapter = new FakeAdapter([{ id: "r1" as RobotId, startNodeId: "n0_0" }], map);
+      const orch = new Orchestrator(map, adapter, {
+        watchdogTicks: 5,
+        blockedTicksLimit: 30,
+        offlineGraceMs: 10_000_000, // never reached in this test
+      });
+      adapter.tick();
+      orch.tickOnce();
+      const order = orch.submitOrder("n4_0", "n0_0");
+      orch.tickOnce(); // dispatch: pick leg created
+
+      adapter.setConnection("r1" as RobotId, false);
+      orch.tickOnce(); // processes the connection event -> rt.online = false
+
+      // Stay offline for well longer than watchdogTicks (5) — the
+      // orchestrator keeps ticking (tickCount keeps advancing) throughout;
+      // only the #14/#15 CHECK is suppressed by the rt.online gate.
+      for (let i = 0; i < 12; i++) orch.tickOnce();
+      expect(orch.getAlarms().some((a) => a.includes("no physical progress"))).toBe(false);
+
+      // Reconnect. Pre-fix, this single tick alone (tickCount already far
+      // past lastProgressTick + watchdogTicks, using the STALE
+      // pre-outage lastProgressTick) would fire the watchdog immediately,
+      // right here, before the robot ever got a chance to move again.
+      adapter.setConnection("r1" as RobotId, true);
+      orch.tickOnce();
+      expect(orch.getAlarms().some((a) => a.includes("no physical progress"))).toBe(false);
+
+      // Next ticks make real progress; the order completes normally with no
+      // watchdog alarm ever firing.
+      let completed = false;
+      for (let i = 0; i < 60 && !completed; i++) {
+        step(orch, adapter);
+        completed = orch.snapshot().orders.find((o) => o.id === order.id)?.status === "completed";
+      }
+      expect(completed).toBe(true);
+      expect(orch.getAlarms().some((a) => a.includes("no physical progress"))).toBe(false);
+    });
+
     it("IMPORTANT regression: a genuinely blocked leg is resolved by the backstop before the watchdog ever fires", () => {
       // Review finding (Important 3): the watchdogTicks > blockedTicksLimit
       // interaction must be proven with a real run, not assumed. 3x1

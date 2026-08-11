@@ -405,10 +405,29 @@ export class Orchestrator {
       case "connection": {
         const rt = this.robots.get(e.robotId);
         if (!rt) break; // no known state yet for this robot; ignore
+        const wasOffline = !rt.online;
         rt.online = e.online;
         if (e.online) {
           rt.offlineSinceMs = undefined;
           rt.offlineHandled = false;
+          // Reconnect-instant-fire fix: the #15 watchdog is gated off
+          // entirely while rt.online is false (see runRouting()), but that
+          // gate alone does NOT freeze leg.lastProgressTick — tickCount
+          // keeps advancing every tick regardless of connectivity. A robot
+          // offline for longer than watchdogTicks (but still short of
+          // offlineGraceMs, so handleOfflineTimeouts() hasn't claimed it
+          // yet) would otherwise get the watchdog gate lifted back on the
+          // very first post-reconnect tick with an already-expired clock,
+          // firing before the robot can report so much as a single tick of
+          // real movement. Reconnecting is not itself progress, but it DOES
+          // deserve a fresh window to prove it: refresh lastProgressTick (and
+          // offWindowTicks, for the same reason — a stale positional snap
+          // from before the outage shouldn't count against it either) to
+          // this tick, exactly like a genuine progress advance would.
+          if (wasOffline && rt.leg) {
+            rt.leg.lastProgressTick = this.tickCount;
+            rt.leg.offWindowTicks = 0;
+          }
         } else if (rt.offlineSinceMs === undefined) {
           rt.offlineSinceMs = this.nowMs();
         }
@@ -1058,6 +1077,14 @@ export class Orchestrator {
         //
         // Two consecutive ticks required: a single stale positional snap is
         // routine and must not kill a healthy leg.
+        //
+        // Accepted tradeoff: a robot physically bumped BACKWARD onto an
+        // already-passed path node reads as on-path (full-path membership
+        // makes no distinction between ahead-of and behind-progressIndex),
+        // so #14 never fires for it and progressIndex never re-advances
+        // either — the #15 watchdog is what eventually catches this case,
+        // once lastProgressTick ages past watchdogTicks with no further
+        // forward progress.
         const onCommittedPath =
           leg.nodeIds.includes(rt.currentNodeId) ||
           (rt.lastVdaNodeId !== undefined && leg.nodeIds.includes(rt.lastVdaNodeId));
