@@ -212,6 +212,10 @@ export class Orchestrator {
   private readonly eventQueue: AdapterEvent[] = [];
   private readonly allOrders: TransportOrder[] = [];
   private readonly alarms: string[] = [];
+  /** Count of alarms evicted by `pushAlarm()`'s ring-buffer cap so far (never resets). */
+  private droppedAlarms = 0;
+  /** Ring-buffer cap for `alarms` — see `pushAlarm()`. */
+  private static readonly ALARM_CAP = 500;
   private readonly cycleTimes: number[] = [];
   private completions = 0;
   private tickCount = 0;
@@ -311,9 +315,27 @@ export class Orchestrator {
     };
   }
 
+  /**
+   * Appends one alarm, then caps the log at `ALARM_CAP` entries (drop-
+   * oldest) so a long-running orchestrator that hits sustained contention
+   * or repeated failures doesn't grow `alarms` unboundedly — every alarm
+   * call site pushes through here rather than touching `this.alarms`
+   * directly. Evicted entries are counted in `droppedAlarms`, surfaced by
+   * `getAlarms()` as a synthetic head line rather than silently lost.
+   */
+  private pushAlarm(msg: string): void {
+    this.alarms.push(msg);
+    if (this.alarms.length > Orchestrator.ALARM_CAP) {
+      const overflow = this.alarms.length - Orchestrator.ALARM_CAP;
+      this.alarms.splice(0, overflow);
+      this.droppedAlarms += overflow;
+    }
+  }
+
   /** Test/debug hook: alarm log accumulated so far (contention, quarantine, offline, failures). */
   getAlarms(): string[] {
-    return [...this.alarms];
+    const head = this.droppedAlarms > 0 ? [`(${this.droppedAlarms} older alarms dropped)`] : [];
+    return [...head, ...this.alarms];
   }
 
   /** Test/debug hook: reservation-table ownership pass-through, for asserting collision-hole-free recovery around the deadlock backstop. */
@@ -361,7 +383,7 @@ export class Orchestrator {
       this.runDispatch();
       this.runRouting();
     } catch (err) {
-      this.alarms.push(`t=${this.tickCount} tick threw: ${String(err)}`);
+      this.pushAlarm(`t=${this.tickCount} tick threw: ${String(err)}`);
     }
   }
 
@@ -502,7 +524,7 @@ export class Orchestrator {
     if (activeOrder && activeOrder.id === orderId) {
       return activeOrder;
     }
-    this.alarms.push(
+    this.pushAlarm(
       `t=${this.tickCount} stale ${kind} from robot ${robotId} for order ${orderId} — ` +
         `not its current order, ignoring (order not advanced)`
     );
@@ -538,7 +560,7 @@ export class Orchestrator {
       if (rt.leg?.kind === "yield" && rt.leg.missionId === missionId) {
         setLeg(rt, undefined); // yield done (or harmlessly cut short)
       } else {
-        this.alarms.push(
+        this.pushAlarm(
           `t=${this.tickCount} stale yield missionDone from robot ${robotId} for ${missionId} — ignoring`
         );
       }
@@ -632,7 +654,7 @@ export class Orchestrator {
           // disagreeing/absent position snap (progressIndex reset to 0
           // keeps it monotonic: 0 is always a valid — and here the only —
           // index into the new, single-element nodeIds).
-          this.alarms.push(
+          this.pushAlarm(
             `t=${this.tickCount} committed path complete (not yet leg goal) for robot ${robotId}, ` +
               `order ${orderId} (leg=${leg}, at=${String(rt.currentNodeId)}, lastVdaNodeId=${String(rt.lastVdaNodeId)}, ` +
               `goal=${currentLeg.goalNode}) — resuming, not requeueing`
@@ -672,7 +694,7 @@ export class Orchestrator {
           return;
         }
 
-        this.alarms.push(
+        this.pushAlarm(
           `t=${this.tickCount} premature missionDone from robot ${robotId} for order ${orderId} ` +
             `(leg=${leg}, at=${String(rt.currentNodeId)}, lastVdaNodeId=${String(rt.lastVdaNodeId)}, goal=${currentLeg.goalNode}) — cancelling and requeueing`
         );
@@ -741,11 +763,11 @@ export class Orchestrator {
     if (missionId.startsWith("yield:")) {
       if (rt.leg?.kind === "yield" && rt.leg.missionId === missionId) {
         setLeg(rt, undefined);
-        this.alarms.push(
+        this.pushAlarm(
           `t=${this.tickCount} yield mission failed for robot ${robotId}: ${reason}`
         );
       } else {
-        this.alarms.push(
+        this.pushAlarm(
           `t=${this.tickCount} stale yield missionFailed from robot ${robotId} for ${missionId} — ignoring`
         );
       }
@@ -757,7 +779,7 @@ export class Orchestrator {
       // Can't even tell which order this was for; just stop this robot
       // driving anything further and log it.
       setLeg(rt, undefined);
-      this.alarms.push(
+      this.pushAlarm(
         `t=${this.tickCount} missionFailed from robot ${robotId} with unparseable mission id "${missionId}": ${reason}`
       );
       return;
@@ -773,7 +795,7 @@ export class Orchestrator {
     }
     this.reservations.releaseAll(robotId);
     setLeg(rt, undefined);
-    this.alarms.push(`t=${this.tickCount} mission failed for robot ${robotId}: ${reason}`);
+    this.pushAlarm(`t=${this.tickCount} mission failed for robot ${robotId}: ${reason}`);
   }
 
   /**
@@ -807,7 +829,7 @@ export class Orchestrator {
         if (!rt.quarantined) {
           rt.quarantined = true;
           rt.state.status = "ERROR";
-          this.alarms.push(
+          this.pushAlarm(
             `t=${this.tickCount} robot ${id} at unresolvable position ${cellKey(rt.state.pos)} — quarantined`
           );
           const order = this.book.byRobot(asCoreRobotId(id));
@@ -835,7 +857,7 @@ export class Orchestrator {
 
       if (rt.quarantined) {
         rt.quarantined = false;
-        this.alarms.push(`t=${this.tickCount} robot ${id} position recovered, un-quarantined`);
+        this.pushAlarm(`t=${this.tickCount} robot ${id} position recovered, un-quarantined`);
         if (rt.state.status === "ERROR") rt.state.status = "IDLE";
       }
 
@@ -855,7 +877,7 @@ export class Orchestrator {
           // re-claims). Alarmed here, not silently swallowed, so the "idle
           // robots own their cell" invariant is directly observable if it
           // is ever violated again.
-          this.alarms.push(
+          this.pushAlarm(
             `t=${this.tickCount} robot ${id} idle self-claim of ${idleCell} DENIED ` +
               `(owner=${String(this.reservations.owner(idleCell))}) — collision-hole invariant violated`
           );
@@ -912,7 +934,7 @@ export class Orchestrator {
       void this.adapter.cancelMission(id).catch(() => {
         /* best-effort; robot is unreachable anyway */
       });
-      this.alarms.push(
+      this.pushAlarm(
         `t=${this.tickCount} robot ${id} offline > ${grace}ms — order requeued, mission cancelled`
       );
     }
@@ -1144,7 +1166,7 @@ export class Orchestrator {
           } else {
             leg.blockedTicks++;
             const deniedCell = dedupedCells[granted.length] ?? dedupedCells[0]!;
-            this.alarms.push(
+            this.pushAlarm(
               `t=${this.tickCount} contention: robot ${id} blocked at ${deniedCell} ` +
                 `(owner=${String(this.reservations.owner(deniedCell))}, blockedTicks=${leg.blockedTicks})`
             );
@@ -1170,7 +1192,7 @@ export class Orchestrator {
           // -corridor case, not only for claim() rejections.
           leg.blockedTicks++;
           const stuckCell = cellKey(this.map.node(frontierNode).pos);
-          this.alarms.push(
+          this.pushAlarm(
             `t=${this.tickCount} contention: robot ${id} blocked at ${stuckCell} ` +
               `(no forward candidate, blockedTicks=${leg.blockedTicks})`
           );
@@ -1190,7 +1212,7 @@ export class Orchestrator {
         void this.adapter
           .sendMission({ id: missionId, robotId: id, nodeIds }, this.map)
           .catch((err) => {
-            this.alarms.push(`t=${this.tickCount} sendMission failed for ${id}: ${String(err)}`);
+            this.pushAlarm(`t=${this.tickCount} sendMission failed for ${id}: ${String(err)}`);
             // Retry next tick: a rejected send is otherwise never retried
             // once nothing else changes (gated extension means the same
             // nodeIds may not get appended again for a while), hanging the
@@ -1231,11 +1253,11 @@ export class Orchestrator {
     // by recoverLeg(), the #14/#15 recovery entry point), so it exists
     // exactly ONCE in this file.
     if (leg.kind === "order") {
-      this.alarms.push(
+      this.pushAlarm(
         `t=${this.tickCount} robot ${id} blocked ${leg.blockedTicks} ticks at ${deniedCell} — requeueing order ${leg.orderId}`
       );
     } else {
-      this.alarms.push(
+      this.pushAlarm(
         `t=${this.tickCount} robot ${id} blocked ${leg.blockedTicks} ticks at ${deniedCell} — abandoning yield`
       );
     }
@@ -1253,7 +1275,7 @@ export class Orchestrator {
    * must exist in exactly one place.
    */
   private recoverLeg(id: RobotId, rt: RobotRuntime, leg: RobotLeg, reason: string): void {
-    this.alarms.push(
+    this.pushAlarm(
       `t=${this.tickCount} robot ${id} ${reason} — recovering ` +
         `(${leg.kind === "order" ? "order requeued" : "yield abandoned"})`
     );
@@ -1349,7 +1371,7 @@ export class Orchestrator {
         offWindowTicks: 0,
         lastProgressTick: this.tickCount,
       });
-      this.alarms.push(
+      this.pushAlarm(
         `t=${this.tickCount} yield: robot ${ownerId} at ${nodeId} asked to vacate to ${target} (blocking ${blockedId})`
       );
       return true;

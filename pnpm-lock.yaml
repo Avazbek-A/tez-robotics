@@ -72,6 +72,9 @@ importers:
       '@tez/core':
         specifier: workspace:*
         version: link:../core
+      '@tez/shared':
+        specifier: workspace:*
+        version: link:../shared
       vda-5050-lib:
         specifier: ^1.7
         version: 1.7.2
@@ -82,9 +85,6 @@ importers:
       '@tez/robot-interface':
         specifier: workspace:*
         version: link:../robot-interface
-      '@tez/shared':
-        specifier: workspace:*
-        version: link:../shared
 
 packages:
 

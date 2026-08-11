@@ -1,4 +1,4 @@
-import type { RobotId, RobotState, GridPos } from "@tez/shared";
+import { DEFAULT_MAP_ID, type RobotId, type RobotState, type GridPos } from "@tez/shared";
 import type { WarehouseMap } from "@tez/core";
 import type { Mission, AdapterEvent, RobotAdapter } from "./adapter.js";
 import {
@@ -102,8 +102,6 @@ interface TrackedOrder {
    */
   lastSeq: number;
 }
-
-const MAP_ID = "warehouse";
 
 /**
  * C2 fix — ERROR status latch: VDA5050 order/instant-action lifecycle
@@ -212,6 +210,12 @@ export class Vda5050Adapter implements RobotAdapter {
    * bounding in practice (e.g. a process that runs for a very long time
    * across a very large number of orders), an LRU or periodic sweep keyed
    * on `orders`-entry-clear time would be the place to add it.
+   *
+   * #8: `stop()` IS an exception to "never cleared" — a full adapter
+   * shutdown is exactly the point at which "never revisited again" becomes
+   * true for every tracked attempt, so `stop()` clears this map too (along
+   * with the other per-robot tracking maps below) rather than leaking it
+   * for the remaining process lifetime.
    */
   private readonly attemptCounters = new Map<string, number>();
   private readonly lastNodeIdByRobot = new Map<RobotId, string>();
@@ -277,6 +281,20 @@ export class Vda5050Adapter implements RobotAdapter {
     const mc = this.mc;
     this.mc = undefined;
     await mc.stop();
+
+    // #8: release every per-robot tracking map so a stopped adapter doesn't
+    // pin memory for a fleet it's no longer serving. Safe ONLY here — this
+    // is the adapter's full shutdown, not a mid-operation event — never
+    // clear these during normal running (see e.g. `attemptCounters`' own
+    // doc comment on why it must otherwise survive cancel/terminal cycles
+    // within a live run). A subsequent start() begins a fresh tracking
+    // session from empty maps, matching a real AGV fleet reconnecting from
+    // scratch.
+    this.orders.clear();
+    this.attemptCounters.clear();
+    this.lastNodeIdByRobot.clear();
+    this.lastPosByRobot.clear();
+    this.warnedUnknownRobots.clear();
   }
 
   async sendMission(m: Mission, map: WarehouseMap): Promise<void> {
@@ -325,7 +343,7 @@ export class Vda5050Adapter implements RobotAdapter {
         nodeId,
         sequenceId: startSeq + i * 2,
         released: true,
-        nodePosition: { x: pos.x, y: pos.y, mapId: MAP_ID },
+        nodePosition: { x: pos.x, y: pos.y, mapId: DEFAULT_MAP_ID },
         actions: [],
       };
     });
@@ -420,6 +438,17 @@ export class Vda5050Adapter implements RobotAdapter {
 
   on(handler: (e: AdapterEvent) => void): void {
     this.handlers.push(handler);
+  }
+
+  /** Test-only hook: live entry counts for every per-robot tracking map, for asserting #8's stop() cleanup empties them all. */
+  _trackingSizes(): Record<string, number> {
+    return {
+      orders: this.orders.size,
+      attemptCounters: this.attemptCounters.size,
+      lastNodeIdByRobot: this.lastNodeIdByRobot.size,
+      lastPosByRobot: this.lastPosByRobot.size,
+      warnedUnknownRobots: this.warnedUnknownRobots.size,
+    };
   }
 
   // ---- internals -----------------------------------------------------

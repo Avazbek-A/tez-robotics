@@ -2290,4 +2290,46 @@ describe("Orchestrator", () => {
       expect(orch.getAlarms().some((a) => a.includes("no physical progress"))).toBe(false);
     });
   });
+
+  describe("growth hygiene: alarm ring buffer (#8)", () => {
+    it("alarm log is capped and reports how many were dropped", () => {
+      // Bare 3x1 corridor, r2 idle-parked at n1_0 (see the dedicated "3x1
+      // corridor with no side-step cell" yield test above): there is no
+      // side-step cell for r2 to yield into and no alternate route around
+      // it, so r1's drop leg (n0_0 -> n2_0) is permanently blocked and
+      // "contention: ... no forward candidate" fires exactly once per
+      // orchestrator tick, forever, with nothing to ever resolve it.
+      // blockedTicksLimit is set far above this test's own tick budget so
+      // the deadlock backstop never fires and requeues/resets the leg —
+      // the alarm stream just keeps climbing, which is exactly the
+      // unbounded-growth condition pushAlarm()'s cap exists to guard
+      // against.
+      const map = WarehouseMap.fromJSON(WarehouseMap.grid(3, 1));
+      const adapter = new FakeAdapter(
+        [
+          { id: "r1" as RobotId, startNodeId: "n0_0" },
+          { id: "r2" as RobotId, startNodeId: "n1_0" },
+        ],
+        map
+      );
+      const orch = new Orchestrator(map, adapter, {
+        horizon: 3,
+        yieldAfterTicks: 3,
+        blockedTicksLimit: 10_000,
+      });
+      adapter.tick();
+      orch.tickOnce();
+      orch.submitOrder("n0_0", "n2_0");
+
+      for (let i = 0; i < 600; i++) {
+        adapter.tick();
+        orch.tickOnce();
+      }
+
+      const alarms = orch.getAlarms();
+      // Cap (500) plus at most one synthetic "dropped" head line.
+      expect(alarms.length).toBeLessThanOrEqual(501);
+      expect(alarms[0]).toMatch(/^\(\d+ older alarms dropped\)$/);
+    });
+  });
 });

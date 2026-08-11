@@ -13,11 +13,11 @@
   },
   "dependencies": {
     "@tez/core": "workspace:*",
+    "@tez/shared": "workspace:*",
     "vda-5050-lib": "^1.7"
   },
   "devDependencies": {
     "@tez/orchestrator": "workspace:*",
-    "@tez/robot-interface": "workspace:*",
-    "@tez/shared": "workspace:*"
+    "@tez/robot-interface": "workspace:*"
   }
 }

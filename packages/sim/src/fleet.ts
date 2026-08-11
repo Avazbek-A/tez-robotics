@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { WarehouseMap } from "@tez/core";
+import { DEFAULT_MAP_ID } from "@tez/shared";
 import { AgvController, VirtualAgvAdapter, type AgvId, type ClientOptions, type VdaVersion } from "vda-5050-lib";
 
 /**
@@ -7,13 +8,14 @@ import { AgvController, VirtualAgvAdapter, type AgvId, type ClientOptions, type 
  * (since `VirtualAgvAdapter` requires the vehicle to already be positioned
  * "on" a released order's first node within its deviation tolerance), for
  * every order node's `nodePosition.mapId` it will ever be sent. This MUST
- * match the `MAP_ID` constant `Vda5050Adapter` (in `@tez/robot-interface`)
- * hardcodes onto every `sendMission`-built VDA node — see that file's
- * private `MAP_ID = "warehouse"` constant, not exported, hence duplicated
- * here rather than imported. `packages/orchestrator/test/vda5050-integration.test.ts`
- * relies on the same coupling.
+ * match what `Vda5050Adapter` (in `@tez/robot-interface`) puts onto every
+ * `sendMission`-built VDA node — both now import the shared
+ * `DEFAULT_MAP_ID` constant (`@tez/shared`) instead of each keeping its own
+ * private, hardcoded copy (#5), so they stay in lockstep by construction.
+ * `packages/orchestrator/test/vda5050-integration.test.ts` relies on the
+ * same coupling.
  */
-const MAP_ID = "warehouse";
+const MAP_ID = DEFAULT_MAP_ID;
 
 const MANUFACTURER = "tez";
 
