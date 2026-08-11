@@ -121,6 +121,44 @@ describe("Orchestrator", () => {
     });
   });
 
+  describe("submitOrder validation", () => {
+    it("rejects an order referencing an unknown node and the order is never created", () => {
+      const map = grid(4);
+      const adapter = new FakeAdapter([{ id: "r1", startNodeId: "n0_0" }], map);
+      const clock = fakeClock();
+      const orchestrator = new Orchestrator(map, adapter, { now: clock.now });
+
+      expect(() => orchestrator.submitOrder("bogus-node", "n3_3")).toThrow();
+      expect(() => orchestrator.submitOrder("n2_0", "bogus-node")).toThrow();
+
+      const snap = orchestrator.snapshot();
+      expect(snap.orders.length).toBe(0);
+    });
+
+    it("does not freeze the fleet: a rejected submission does not block a valid order's own completion", () => {
+      const map = grid(4);
+      const adapter = new FakeAdapter([{ id: "r1", startNodeId: "n0_0" }], map);
+      const clock = fakeClock();
+      const orchestrator = new Orchestrator(map, adapter, { now: clock.now });
+
+      expect(() => orchestrator.submitOrder("bogus-node", "n3_3")).toThrow();
+
+      const order = orchestrator.submitOrder("n2_0", "n3_3");
+      expect(order.status).toBe("queued");
+
+      let completed = false;
+      for (let i = 0; i < 60 && !completed; i++) {
+        step(orchestrator, adapter);
+        const snap = orchestrator.snapshot();
+        const found = snap.orders.find((o) => o.id === order.id);
+        if (found?.status === "completed") completed = true;
+      }
+
+      expect(completed).toBe(true);
+      expect(orchestrator.getAlarms().some((a) => a.includes("tick threw"))).toBe(false);
+    });
+  });
+
   describe("two robots, two orders, parallel — no collision", () => {
     it("routes both orders concurrently with zero shared-cell ticks", () => {
       const map = grid(5);

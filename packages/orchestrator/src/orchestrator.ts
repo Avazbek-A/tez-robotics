@@ -185,7 +185,21 @@ export class Orchestrator {
     this.runTick();
   }
 
+  /**
+   * Validates both node ids against the map BEFORE creating the order.
+   * Without this, an order referencing an unknown node reaches dispatch(),
+   * gets assigned to a robot, and runRouting() -> map.distance()/map.node()
+   * throws inside runTick()'s top-level try/catch — which only logs an
+   * alarm and skips the rest of THAT tick. The bogus order stays queued
+   * (never removed from the book) and re-triggers the same throw on every
+   * subsequent tick, before runRouting() ever gets to move any OTHER
+   * robot's leg forward — freezing the whole fleet forever. Rejecting here,
+   * synchronously, back to the caller keeps a bad submission from ever
+   * being able to reach the tick pipeline at all.
+   */
   submitOrder(pickupNode: string, dropNode: string): TransportOrder {
+    this.map.node(pickupNode);
+    this.map.node(dropNode);
     const order = this.book.create(pickupNode, dropNode);
     this.allOrders.push(order);
     return order;
