@@ -10,6 +10,8 @@ import { RobotCard } from "./components/RobotCard";
 import { TaskQueue } from "./components/TaskQueue";
 import { KpiRow } from "./components/KpiRow";
 import { AlarmDrawer } from "./components/AlarmDrawer";
+import { OrdersTab } from "./tabs/OrdersTab";
+import { AnalyticsTab } from "./tabs/AnalyticsTab";
 
 type Tab = "cockpit" | "orders" | "analytics";
 
@@ -230,8 +232,8 @@ export default function App() {
 
       <main className="flex-1 p-4">
         {tab === "cockpit" && <Cockpit />}
-        {tab === "orders" && <section aria-label="Orders" />}
-        {tab === "analytics" && <section aria-label="Analytics" />}
+        {tab === "orders" && <OrdersTab />}
+        {tab === "analytics" && <AnalyticsTab />}
       </main>
     </div>
   );

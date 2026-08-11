@@ -1,7 +1,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocket as NodeWebSocketClient, WebSocketServer } from "ws";
-import { fleetStore, useFleetStore } from "../src/store";
+import { KPI_BUFFER_CAP, fleetStore, useFleetStore } from "../src/store";
 import { startWsClient } from "../src/ws-client";
 import type { WsClient } from "../src/ws-client";
 import type { StateFrame } from "../src/types";
@@ -22,6 +22,7 @@ const INITIAL_FLEET_STATE = {
   connection: "connecting" as const,
   frame: undefined,
   lastFrameAt: undefined,
+  kpiBuffer: [],
   selectedRobotId: undefined,
 };
 
@@ -56,6 +57,35 @@ describe("fleetStore", () => {
   it("setConnection updates the connection state", () => {
     fleetStore.getState().setConnection("connected");
     expect(fleetStore.getState().connection).toBe("connected");
+  });
+
+  it("applyFrame appends one kpiBuffer sample per call", () => {
+    expect(fleetStore.getState().kpiBuffer).toHaveLength(0);
+
+    fleetStore.getState().applyFrame(makeFrame(1));
+    expect(fleetStore.getState().kpiBuffer).toHaveLength(1);
+    expect(fleetStore.getState().kpiBuffer[0]).toMatchObject({
+      kpis: { ordersPerHour: 0, avgCycleMs: 0, utilization: 0 },
+    });
+    expect(typeof fleetStore.getState().kpiBuffer[0].t).toBe("number");
+
+    fleetStore.getState().applyFrame(makeFrame(2));
+    expect(fleetStore.getState().kpiBuffer).toHaveLength(2);
+  });
+
+  it("applyFrame caps kpiBuffer at 600 samples, dropping the oldest first", () => {
+    for (let i = 0; i < KPI_BUFFER_CAP + 50; i++) {
+      const frame = makeFrame(i);
+      frame.kpis = { ordersPerHour: i, avgCycleMs: 0, utilization: 0 };
+      fleetStore.getState().applyFrame(frame);
+    }
+
+    const buffer = fleetStore.getState().kpiBuffer;
+    expect(buffer).toHaveLength(KPI_BUFFER_CAP);
+    // Oldest 50 samples (ordersPerHour 0..49) were dropped; the buffer now
+    // starts at sample 50 and ends at the last appended sample.
+    expect(buffer[0].kpis.ordersPerHour).toBe(50);
+    expect(buffer[buffer.length - 1].kpis.ordersPerHour).toBe(KPI_BUFFER_CAP + 49);
   });
 
   it("useFleetStore mirrors the vanilla store and re-renders on change", () => {
