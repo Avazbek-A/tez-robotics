@@ -1,0 +1,21 @@
+{
+  "name": "@tez/persistence",
+  "version": "0.0.1",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.5.4",
+    "@tez/core": "workspace:*",
+    "@tez/shared": "workspace:*",
+    "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.21.0",
+    "typescript": "^5.5",
+    "vitest": "^2"
+  }
+}
