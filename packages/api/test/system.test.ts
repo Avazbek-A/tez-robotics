@@ -18,4 +18,11 @@ describe("buildSystem demo mode", () => {
       await sys.stop();
     }
   });
+
+  it("stop() is idempotent — calling it twice does not throw", async () => {
+    const sys = await buildSystem(loadConfig({ DEMO: "1", TICK_MS: "10" }));
+    await sys.start();
+    await expect(sys.stop()).resolves.toBeUndefined();
+    await expect(sys.stop()).resolves.toBeUndefined();
+  });
 });

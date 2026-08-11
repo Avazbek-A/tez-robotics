@@ -79,6 +79,10 @@ function buildDemoSystem(config: ApiConfig, map: WarehouseMap, mapJson: unknown)
 
 async function buildVdaSystem(config: ApiConfig, map: WarehouseMap, mapJson: unknown): Promise<System> {
   let devBroker: DevBrokerResult | undefined;
+  // devBroker takes precedence over config.mqttUrl whenever config.devBroker is
+  // true: a broker is always started in that case, and its url is used. In
+  // practice loadConfig's fail-fast rule means valid configs only ever supply
+  // one or the other, so this only matters if both happen to be set.
   let mqttUrl = config.mqttUrl;
   if (config.devBroker) {
     devBroker = await startDevBroker();
@@ -108,7 +112,9 @@ async function buildVdaSystem(config: ApiConfig, map: WarehouseMap, mapJson: unk
     async stop() {
       await orchestrator.stop();
       if (devBroker) {
-        await devBroker.close();
+        const broker = devBroker;
+        devBroker = undefined;
+        await broker.close();
       }
     },
   };
