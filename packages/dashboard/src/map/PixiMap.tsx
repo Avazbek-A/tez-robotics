@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Application } from "pixi.js";
 import { Viewport } from "pixi-viewport";
 import { fleetStore } from "../store";
@@ -16,6 +16,7 @@ const MAX_ZOOM = 4;
  */
 export default function PixiMap() {
   const hostRef = useRef<HTMLDivElement | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -27,6 +28,28 @@ export default function PixiMap() {
     let renderer: Renderer | null = null;
     let resizeObserver: ResizeObserver | null = null;
     let unsubscribe: (() => void) | null = null;
+
+    // Single owner of teardown. `setup()` (post-fetch) and the effect
+    // cleanup can both race to destroy the same Pixi Application — whoever
+    // gets here first wins, the other is a no-op. This is safe *without*
+    // locking because JS is single-threaded: everything between two
+    // `await` points runs atomically, so there is no interleaving where
+    // both branches see `destroyed === false` at once.
+    let destroyed = false;
+    function destroyEverything(): void {
+      if (destroyed) return;
+      destroyed = true;
+      resizeObserver?.disconnect();
+      unsubscribe?.();
+      renderer?.destroy();
+      viewport?.destroy();
+      app?.destroy(true, { children: true });
+      app = null;
+      viewport = null;
+      renderer = null;
+      resizeObserver = null;
+      unsubscribe = null;
+    }
 
     async function setup(): Promise<void> {
       const width = host!.clientWidth || 800;
@@ -43,7 +66,11 @@ export default function PixiMap() {
       });
 
       // The effect may have been cleaned up while `init` was in flight
-      // (React StrictMode double-invokes effects in dev).
+      // (React StrictMode double-invokes effects in dev). `app` (the outer
+      // ref `destroyEverything` owns) was never assigned yet, so cleanup's
+      // `destroyEverything()` couldn't have touched this instance — destroy
+      // it directly here, once init() has actually resolved (destroying
+      // before init() resolves is unsafe: the renderer isn't attached yet).
       if (cancelled) {
         application.destroy(true, { children: true });
         return;
@@ -52,10 +79,20 @@ export default function PixiMap() {
       host!.appendChild(application.canvas);
 
       const mapRes = await fetch("/map");
+      if (!mapRes.ok) {
+        throw new Error(`GET /map failed: ${mapRes.status} ${mapRes.statusText}`);
+      }
       const mapJson = (await mapRes.json()) as RawMapLike;
 
+      // By now `app` above WAS assigned before this await, so if the effect
+      // was cleaned up while the fetch was in flight, cleanup's
+      // `destroyEverything()` already ran and destroyed it. Route through
+      // the same guarded function instead of destroying `application`
+      // again directly — it no-ops when cleanup got there first, and
+      // still destroys when this async continuation is the first (and
+      // only) one to observe `cancelled`.
       if (cancelled) {
-        application.destroy(true, { children: true });
+        destroyEverything();
         return;
       }
 
@@ -109,17 +146,31 @@ export default function PixiMap() {
       resizeObserver.observe(host!);
     }
 
-    void setup();
+    setup().catch((err: unknown) => {
+      // Covers: WebGL/canvas unavailable, non-2xx /map, malformed JSON, or
+      // any other failure partway through setup. Tear down whatever
+      // partial state was created (idempotent — safe even if cleanup
+      // already ran) so nothing leaks, then surface a fallback instead of
+      // leaving the Cockpit tab silently blank.
+      destroyEverything();
+      if (cancelled) return;
+      console.error("[PixiMap] failed to initialize live map", err);
+      setError(err instanceof Error ? err.message : String(err));
+    });
 
     return () => {
       cancelled = true;
-      resizeObserver?.disconnect();
-      unsubscribe?.();
-      renderer?.destroy();
-      viewport?.destroy();
-      app?.destroy(true, { children: true });
+      destroyEverything();
     };
   }, []);
+
+  if (error) {
+    return (
+      <div className="flex h-full w-full items-center justify-center p-4 text-center text-sm text-[var(--text)]/60">
+        Failed to load the live map: {error}
+      </div>
+    );
+  }
 
   return <div ref={hostRef} className="h-full w-full" />;
 }
