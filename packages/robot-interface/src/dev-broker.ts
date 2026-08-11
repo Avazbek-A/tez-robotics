@@ -1,7 +1,6 @@
 import http from 'http';
 import net from 'net';
 import type { Duplex } from 'node:stream';
-import { createBroker } from 'aedes';
 import wsStream from 'websocket-stream';
 
 export interface DevBrokerResult {
@@ -59,7 +58,23 @@ export async function startDevBroker(opts?: DevBrokerOptions): Promise<DevBroker
   const targetPort = opts?.port ?? 1883;
   const targetWsPort = opts?.wsPort ?? 9001;
 
-  const broker = createBroker();
+  // aedes is CommonJS with `module.exports = Aedes.createBroker = Aedes` (no
+  // `exports.createBroker = ...` for cjs-module-lexer to pick up). Under
+  // tsx/vitest's transform a static `import { createBroker } from 'aedes'`
+  // is quietly rewritten to work, but under bare `node` on the built dist
+  // it throws `SyntaxError: Named export 'createBroker' not found` — only
+  // `default` is visible via the CJS-to-ESM interop. Lazy dynamic import +
+  // reading `.createBroker` off the default export (a static property that
+  // equals the Aedes constructor itself) survives both tsx/vitest AND
+  // bare-node ESM. (`new` on the default export instead of calling
+  // `.createBroker()` compiles fine at runtime — Aedes's constructor
+  // returns a new instance whether or not it's called with `new` — but it
+  // does NOT type-check here: under NodeNext, TS types a dynamic import()
+  // of this CJS package's default export as the whole module namespace,
+  // which has no construct signature, even though aedes's own .d.ts
+  // declares `export default class Aedes`.)
+  const { default: aedesModule } = await import('aedes');
+  const broker = aedesModule.createBroker();
   const mqttServer = net.createServer(broker.handle);
   const wsHttpServer = http.createServer();
 
