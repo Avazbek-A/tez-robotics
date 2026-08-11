@@ -441,11 +441,81 @@ export class Orchestrator {
     // "stale report" case already handled below via book.transition()'s
     // own try/catch, and must NOT be touched here.
     if (rt.leg && rt.leg.missionId === missionId) {
-      const reachedGoal = rt.currentNodeId === rt.leg.goalNode || rt.lastVdaNodeId === rt.leg.goalNode;
+      const currentLeg = rt.leg;
+      const reachedGoal = rt.currentNodeId === currentLeg.goalNode || rt.lastVdaNodeId === currentLeg.goalNode;
       if (!reachedGoal) {
+        // Task 2 regression fix: under horizon-gated/reservation-blocked
+        // extension, the orchestrator can DELIBERATELY send a mission
+        // shorter than the leg's true goal (paused by opts.horizon, or by
+        // sustained reservation contention) — and a real adapter
+        // truthfully reports THAT sent mission as fully processed the
+        // moment the robot finishes walking it, regardless of whether it
+        // matches the leg's eventual goal: Vda5050Adapter's
+        // handleOrderProcessed() `!active` branch and FakeAdapter.tick()'s
+        // `currentNodeIndex >= nodeIds.length` check both only know about
+        // the specific path they were told to walk, never about the leg's
+        // goal. Distinguish that legitimate "committed prefix fully
+        // executed" case from a genuinely premature/corrupt report: if the
+        // robot's batch-fresh node is exactly the leg's committed FRONTIER
+        // (the last node it was actually sent), this is case (a) — resume,
+        // don't cancel+requeue. Anything else (robot short of even its own
+        // frontier) is case (b), a genuine frontier race / corrupt report —
+        // falls through to the existing cancel+requeue path unchanged.
+        const frontierNode = currentLeg.nodeIds[currentLeg.nodeIds.length - 1];
+        const atFrontier =
+          currentLeg.nodeIds.length > 0 &&
+          rt.currentNodeId !== undefined &&
+          rt.currentNodeId === frontierNode;
+        if (atFrontier) {
+          // Resume: reseed the leg from the robot's current (= frontier)
+          // position exactly like a freshly-created leg, so runRouting()
+          // sends a brand-new mission attempt under the SAME missionId
+          // next tick, and extension naturally continues once
+          // opts.horizon/reservation contention allows. Both adapters
+          // treat a post-done send under a reused missionId as a fresh
+          // attempt (Vda5050Adapter mints a new `${missionId}#n`;
+          // FakeAdapter already cleared `robot.mission` the instant it
+          // fired this very missionDone event, synchronously, before this
+          // handler even runs) — and FakeAdapter's "new mission" branch
+          // sets the robot's position to the FIRST node of the sent path,
+          // so nodeIds MUST start at the robot's true current node, which
+          // it does here (progressIndex reset to 0 keeps it monotonic:
+          // 0 is always a valid — and here the only — index into the new,
+          // single-element nodeIds).
+          this.alarms.push(
+            `t=${this.tickCount} committed path complete (not yet leg goal) for robot ${robotId}, ` +
+              `order ${orderId} (leg=${leg}, at=${String(rt.currentNodeId)}, goal=${currentLeg.goalNode}) ` +
+              `— resuming, not requeueing`
+          );
+          currentLeg.nodeIds = [rt.currentNodeId!];
+          currentLeg.progressIndex = 0;
+          // Deliberately NOT resetting blockedTicks here: doing so proved to
+          // be its own deadlock — a robot with NO viable further extension
+          // (e.g. genuinely, permanently blocked by another parked robot)
+          // completes this trivial "already there" 1-node re-send instantly
+          // every tick, re-entering this exact resume branch every single
+          // time; unconditionally zeroing blockedTicks on every resume
+          // silently absorbed the deadlock backstop's counter before it
+          // could ever reach opts.blockedTicksLimit, leaving the order
+          // hung "dispatched" forever instead of ever reaching the
+          // backstop or genuinely completing. blockedTicks must only ever
+          // be reset by GENUINE forward progress — runRouting()'s own
+          // progress-scan (which advances progressIndex to a NEW, higher
+          // index) already does exactly that, unconditionally, on real
+          // movement, and its successful-extension branch resets it too.
+          // Leaving it untouched here means: if this robot is truly stuck,
+          // repeated resume-then-immediately-redone cycles correctly keep
+          // accumulating blockedTicks (nothing else resets it) until the
+          // deadlock backstop fires; if it's genuinely progressing (just
+          // pacing out its horizon), the very next successful extension
+          // resets it via that existing path regardless.
+          currentLeg.sent = false;
+          return;
+        }
+
         this.alarms.push(
           `t=${this.tickCount} premature missionDone from robot ${robotId} for order ${orderId} ` +
-            `(leg=${leg}, at=${String(rt.currentNodeId)}, lastVdaNodeId=${String(rt.lastVdaNodeId)}, goal=${rt.leg.goalNode}) — cancelling and requeueing`
+            `(leg=${leg}, at=${String(rt.currentNodeId)}, lastVdaNodeId=${String(rt.lastVdaNodeId)}, goal=${currentLeg.goalNode}) — cancelling and requeueing`
         );
         void this.adapter.cancelMission(robotId).catch(() => {
           /* best-effort; robot may be unreachable */

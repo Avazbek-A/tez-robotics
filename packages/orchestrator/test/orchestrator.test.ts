@@ -424,9 +424,18 @@ describe("Orchestrator", () => {
         map
       );
       const clock = fakeClock();
+      // Small blockedTicksLimit: with the frontier-race resume fix
+      // (handleMissionDone no longer misfires "premature missionDone" as a
+      // fast-but-wrong side-channel deadlock detector — see the note
+      // below), the ONLY thing that now detects r2's permanently-blocked
+      // return route is the deadlock backstop itself, which takes
+      // opts.blockedTicksLimit consecutive blocked ticks to fire, up to 3
+      // times (one per requeue). Keep it small so this test's fixed
+      // iteration budget below comfortably covers all 3 cycles.
       const orchestrator = new Orchestrator(map, adapter, {
         now: clock.now,
         offlineGraceMs: 5_000,
+        blockedTicksLimit: 5,
       });
 
       // Pickup close to r1 so it reaches "underway" quickly; drop far away
@@ -473,9 +482,17 @@ describe("Orchestrator", () => {
       // it reaches a definite terminal state instead of the old "always
       // eventually completes" expectation, which relied on the
       // now-fixed advisory-reservations defect (claims never actually
-      // blocked a send).
+      // blocked a send). Detection mechanism: handleMissionDone's
+      // frontier-race guard correctly resumes (not cancel+requeues) every
+      // time r2's short, un-extendable committed mission completes at its
+      // own frontier short of n1_0 — it is NOT a fast-path deadlock
+      // detector (fixing that misclassification was itself a Task 2 fix
+      // round). The ONLY thing that ever detects this permanent block is
+      // the deadlock backstop (opts.blockedTicksLimit consecutive blocked
+      // routing ticks), once per requeue cycle, up to 3 times — hence the
+      // larger iteration budget and the small blockedTicksLimit above.
       let terminal = false;
-      for (let i = 0; i < 40 && !terminal; i++) {
+      for (let i = 0; i < 150 && !terminal; i++) {
         step(orchestrator, adapter);
         const found = orchestrator.snapshot().orders.find((o) => o.id === order.id);
         terminal = found?.status === "completed" || found?.status === "failed";
@@ -789,6 +806,65 @@ describe("Orchestrator", () => {
       expect(orchestrator.getAlarms().some((a) => a.includes("premature missionDone"))).toBe(false);
       const afterOrder = orchestrator.snapshot().orders.find((o) => o.id === order.id);
       expect(afterOrder?.status).toBe("completed");
+    });
+
+    it("(d) committed-path-complete resume: a robot that outruns its horizon-capped mission resumes instead of getting requeued", () => {
+      // Regression test for a real Task 2 defect caught by the sim e2e
+      // soak (Task 3): under horizon-gated extension, the orchestrator can
+      // deliberately send a mission SHORTER than the leg's true goal
+      // (paused by opts.horizon), and when the robot's telemetry arrives
+      // faster than orchestrator ticks — exactly what a real adapter's
+      // wall-clock cadence produces, simulated here by running several
+      // adapter.tick() calls with no intervening orch.tickOnce() — the
+      // robot can fully drain that short committed mission and the
+      // adapter truthfully reports it "done" well before the leg's actual
+      // goal. Pre-fix, the frontier-race guard misclassified this as a
+      // genuine premature/corrupt report and cancelled + requeued the
+      // order every time this happened, exhausting OrderBook's 3-retry
+      // cap and failing orders that were never actually blocked — just
+      // paced by the horizon. The fix: when the robot's batch-fresh node
+      // is exactly the committed FRONTIER (not short of it), resume
+      // instead of requeue.
+      const map = WarehouseMap.fromJSON(WarehouseMap.grid(15, 15));
+      const adapter = new FakeAdapter([{ id: "r1", startNodeId: "n0_0" }], map);
+      const orchestrator = new Orchestrator(map, adapter, { horizon: 3 });
+      adapter.tick();
+      orchestrator.tickOnce();
+      const order = orchestrator.submitOrder("n14_0", "n0_0");
+
+      // Let the pick leg extend up to the horizon cap.
+      for (let i = 0; i < 6; i++) {
+        step(orchestrator, adapter);
+      }
+      const beforeRace = orchestrator.snapshot().orders.find((o) => o.id === order.id);
+      expect(beforeRace?.status).toBe("dispatched");
+      expect(beforeRace?.retries).toBe(0);
+
+      // Race the robot ahead of the orchestrator: several physical ticks
+      // accumulate in the event queue with no orchestrator tick in
+      // between, so the robot fully drains its horizon-capped committed
+      // mission (and the adapter fires missionDone for it) before
+      // runRouting() ever gets a chance to extend it further — repeated a
+      // few times to also exercise it past the pick->drop transition.
+      for (let cycle = 0; cycle < 6; cycle++) {
+        for (let i = 0; i < 5; i++) adapter.tick();
+        orchestrator.tickOnce();
+      }
+
+      let completed = false;
+      for (let i = 0; i < 200 && !completed; i++) {
+        step(orchestrator, adapter);
+        completed = orchestrator.snapshot().orders.find((o) => o.id === order.id)?.status === "completed";
+      }
+      expect(completed).toBe(true);
+
+      const finalOrder = orchestrator.snapshot().orders.find((o) => o.id === order.id);
+      // No requeue ever happened: the order was never blocked, only paced
+      // by the horizon, and the fix must never mistake that for a genuine
+      // frontier race.
+      expect(finalOrder?.retries).toBe(0);
+      expect(orchestrator.getAlarms().some((a) => a.includes("premature missionDone"))).toBe(false);
+      expect(orchestrator.getAlarms().some((a) => a.includes("resuming, not requeueing"))).toBe(true);
     });
   });
 
