@@ -330,27 +330,28 @@ async function main() {
     }
   });
 
-  console.log(`[demo] waiting for api /health...`);
-  const health = await waitForHealth(API_PORT);
-  console.log(`[demo] api healthy:`, health);
-
+  // VDA: register the BROKER_URL=<url> line listener HERE, synchronously,
+  // right after spawnTeeing() — NOT after waitForHealth() below.
+  // packages/api/src/main.ts logs that line immediately after buildSystem()
+  // resolves, which is strictly BEFORE app.listen() — the same listen()
+  // call /health (and therefore waitForHealth()) depends on. spawnTeeing's
+  // stdout handler dispatches each line synchronously to whatever is in its
+  // lineListeners array at that instant, with no buffering/replay for late
+  // subscribers (see spawnTeeing above). So if this listener were attached
+  // only after `await waitForHealth(...)`, the BROKER_URL line would
+  // already have been dispatched to nobody and --vda would always fall
+  // through to the 5s timeout/fallback below — silently wrong on any
+  // non-default broker port. Attaching it here, before any further
+  // `await`, guarantees it's in place before the child process's first
+  // stdout data event can possibly fire (that requires at least one more
+  // turn of the event loop than this synchronous code takes). The promise
+  // itself is only awaited later, once mqttUrl is actually needed.
+  let mqttUrlPromise;
   if (VDA) {
-    // Best-effort per task-12-brief.md: main.ts (as of this task) does not
-    // actually print a `BROKER_URL=<url>` line — the brief's premise that
-    // "main.ts (Task 5) logs [it]" doesn't hold in this checkout (verified:
-    // no such logging exists in packages/api/src/{main,system}.ts), and
-    // adding it is out of scope (packages/api is not in this task's edit
-    // list). Watch stdout for it anyway (forward-compatible if a later task
-    // adds it), falling back after a short grace period to the dev
-    // broker's documented default (mqtt://localhost:1883 — see
-    // packages/robot-interface/src/dev-broker.ts's `startDevBroker`,
-    // called with no opts from system.ts, so it only falls back to an
-    // ephemeral port if 1883 is already busy).
-    const mqttUrl = await new Promise((resolve) => {
+    mqttUrlPromise = new Promise((resolve) => {
       const timer = setTimeout(() => {
         console.warn(
-          "[demo] no BROKER_URL=<url> line seen from the api within 5s " +
-            "(known gap: main.ts doesn't print one — see task-12-report.md); " +
+          "[demo] no BROKER_URL=<url> line seen from the api within 5s; " +
             "assuming the dev broker's default mqtt://localhost:1883",
         );
         resolve("mqtt://localhost:1883");
@@ -363,6 +364,14 @@ async function main() {
         }
       });
     });
+  }
+
+  console.log(`[demo] waiting for api /health...`);
+  const health = await waitForHealth(API_PORT);
+  console.log(`[demo] api healthy:`, health);
+
+  if (VDA) {
+    const mqttUrl = await mqttUrlPromise;
 
     console.log(`[demo] building @tez/sim (best-effort)...`);
     try {
