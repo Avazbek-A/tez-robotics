@@ -1,6 +1,7 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import swagger from "@fastify/swagger";
 import swaggerUi from "@fastify/swagger-ui";
+import type { Repos } from "@tez/persistence";
 import type { System } from "./system.js";
 import type { ApiConfig } from "./config.js";
 import { ordersRoutes } from "./routes/orders.js";
@@ -12,11 +13,12 @@ import { wsRoutes } from "./ws.js";
 
 export interface BuildServerOpts {
   /**
-   * Placeholder for Task 8's persistence layer — unused until then.
-   * Typed as a plain `object` (not yet a concrete `Persistence` interface)
-   * so this signature doesn't need to change when Task 8 lands.
+   * Optional persistence repos (Task 8). When present, GET /orders?history=1
+   * gains DB-backed history and GET /kpi?from=&to= gains a persisted range.
+   * Absent by default — the api is fully functional with no persistence
+   * configured (in-memory history only, no kpi range).
    */
-  persistence?: object;
+  repos?: Repos;
   /**
    * Supplies PUT /map's write target (config.mapFile). Optional so existing
    * callers that only care about system-level behavior (e.g. earlier tasks'
@@ -32,8 +34,6 @@ export interface BuildServerOpts {
  * `fastify.inject`, or a production entrypoint) own binding to a port.
  */
 export async function buildServer(system: System, opts?: BuildServerOpts): Promise<FastifyInstance> {
-  void opts?.persistence; // persistence placeholder unused until Task 8
-
   const app = Fastify();
 
   await app.register(swagger, {
@@ -58,11 +58,11 @@ export async function buildServer(system: System, opts?: BuildServerOpts): Promi
     reply.send(err);
   });
 
-  await app.register(ordersRoutes, { system });
+  await app.register(ordersRoutes, { system, repos: opts?.repos });
   await app.register(robotsRoutes, { system });
   await app.register(healthRoutes, { system });
   await app.register(mapRoutes, { system, mapFile: opts?.config?.mapFile });
-  await app.register(kpiRoutes, { system });
+  await app.register(kpiRoutes, { system, repos: opts?.repos });
   await app.register(wsRoutes, { system });
 
   return app;

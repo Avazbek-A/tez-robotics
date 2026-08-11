@@ -1,9 +1,18 @@
 import type { FastifyInstance, FastifyPluginOptions } from "fastify";
 import { Type, type Static } from "@sinclair/typebox";
+import type { Repos } from "@tez/persistence";
 import type { System } from "../system.js";
 
 export interface OrdersRouteOpts extends FastifyPluginOptions {
   system: System;
+  /**
+   * Optional (Task 8). When present and `?history=1` is passed to
+   * GET /orders, each order's `history` field is replaced with DB rows
+   * (shape: {id, order_id, at, status, robot_id, note}) instead of the
+   * in-memory {at, from, to, reason} entries — hence `history`'s item
+   * schema below is loosely typed rather than pinned to one shape.
+   */
+  repos?: Repos;
 }
 
 const OrderStatusSchema = Type.Union([
@@ -15,13 +24,6 @@ const OrderStatusSchema = Type.Union([
   Type.Literal("canceled"),
 ]);
 
-const HistoryEntrySchema = Type.Object({
-  at: Type.String(),
-  from: OrderStatusSchema,
-  to: OrderStatusSchema,
-  reason: Type.Optional(Type.String()),
-});
-
 export const TransportOrderSchema = Type.Object({
   id: Type.String(),
   pickupNode: Type.String(),
@@ -30,7 +32,10 @@ export const TransportOrderSchema = Type.Object({
   robotId: Type.Optional(Type.String()),
   retries: Type.Number(),
   createdAt: Type.String(),
-  history: Type.Array(HistoryEntrySchema),
+  // Loosely typed: in-memory entries are {at,from,to,reason?}; DB-backed
+  // entries (GET /orders?history=1 with repos present) are
+  // {id,order_id,at,status,robot_id,note} — see OrdersRouteOpts.repos.
+  history: Type.Array(Type.Unknown()),
 });
 
 const CreateOrderBody = Type.Object({
@@ -57,8 +62,13 @@ type OrderIdParams = Static<typeof OrderIdParams>;
  * (Task 2's public API: submitOrder/snapshot) — never OrderBook directly,
  * which is private to the orchestrator package.
  */
+const OrdersListQuery = Type.Object({
+  history: Type.Optional(Type.String()),
+});
+type OrdersListQuery = Static<typeof OrdersListQuery>;
+
 export async function ordersRoutes(app: FastifyInstance, opts: OrdersRouteOpts): Promise<void> {
-  const { system } = opts;
+  const { system, repos } = opts;
 
   app.post<{ Body: CreateOrderBody }>(
     "/orders",
@@ -84,18 +94,30 @@ export async function ordersRoutes(app: FastifyInstance, opts: OrdersRouteOpts):
     }
   );
 
-  app.get(
+  app.get<{ Querystring: OrdersListQuery }>(
     "/orders",
     {
       schema: {
+        querystring: OrdersListQuery,
         response: {
           200: OrdersListResponse,
         },
       },
     },
-    async () => {
+    async (request) => {
       const { orders } = system.orchestrator.snapshot();
-      return { orders };
+      // history=1 without repos: in-memory TransportOrder.history is already
+      // in the payload, so there's nothing more to attach — return as-is.
+      if (request.query.history !== "1" || !repos) {
+        return { orders };
+      }
+      const withDbHistory = await Promise.all(
+        orders.map(async (order) => ({
+          ...order,
+          history: await repos.orders.history(order.id),
+        }))
+      );
+      return { orders: withDbHistory };
     }
   );
 

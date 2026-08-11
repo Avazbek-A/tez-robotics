@@ -38,6 +38,9 @@ importers:
       '@tez/orchestrator':
         specifier: workspace:*
         version: link:../orchestrator
+      '@tez/persistence':
+        specifier: workspace:*
+        version: link:../persistence
       '@tez/robot-interface':
         specifier: workspace:*
         version: link:../robot-interface
