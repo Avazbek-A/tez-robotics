@@ -190,7 +190,7 @@ async function buildFleetAndOrchestrator(
 
 describe.sequential("sim fleet E2E soak (packages/sim)", () => {
   it(
-    "10-robot / 20-order soak on the uncurated 20x10 demo grid: within 5min, >=90% completed (honest threshold, see comments), sustained collisions logged not gated, sane KPIs",
+    "10-robot / 20-order soak on the uncurated 20x10 demo grid: within 5min, >=95% completed, zero sustained collisions (hard gate), sane KPIs",
     async () => {
       const map = await loadMap();
       const ROBOTS = 10;
