@@ -22,11 +22,24 @@ export interface OrchestratorOpts {
    * (= 10s at the default 500ms tick).
    */
   blockedTicksLimit?: number;
+  /**
+   * Blocked-tick count at which a blocked ORDER leg tries to dispatch a
+   * yield mission to a parked idle robot standing in its way, well before
+   * the deadlock backstop (blockedTicksLimit) gives up on the order.
+   * Default 6.
+   */
+  yieldAfterTicks?: number;
+  /**
+   * Minimum ticks between two yield dispatches to the SAME robot, so a
+   * yielded robot is not ping-ponged. Default 20.
+   */
+  yieldCooldownTicks?: number;
   /** Injectable clock (ms epoch), for deterministic tests. Default Date.now. */
   now?: () => number;
 }
 
 interface RobotLeg {
+  kind: "order" | "yield";
   orderId: string;
   phase: "pick" | "drop";
   goalNode: string;
@@ -60,6 +73,8 @@ interface RobotRuntime {
   lastVdaNodeId?: string;
   idleSinceTick?: number;
   leg?: RobotLeg;
+  /** Tick of this robot's most recent yield dispatch, for yieldCooldownTicks anti-thrash. */
+  lastYieldTick?: number;
 }
 
 function asCoreRobotId(id: RobotId): CoreRobotId {
@@ -128,14 +143,22 @@ function setLeg(rt: RobotRuntime, leg: RobotLeg | undefined): void {
  * commanded frontier by any amount up to `opts.horizon`, and reservations
  * (not lockstep) are what keep two robots' committed windows disjoint.
  *
- * Known accepted limitation (BACKLOG, not fixed here): a parked IDLE robot
- * sitting on the only path into an order's pickup/drop permanently owns
- * that cell but is never itself commanded to move out of the way — PIBT
- * only ever pushes it virtually, never dispatches an actual parking move.
- * Such an order blocks every extension attempt until the deadlock backstop
- * (`opts.blockedTicksLimit` consecutive fully-blocked ticks) requeues it;
- * after 3 requeues OrderBook fails it outright rather than ever routing
- * around the parked robot.
+ * Yield dispatch (#13, mitigates the parked-idle-robot case below): when a
+ * blocked ORDER leg's blockedTicks reaches `opts.yieldAfterTicks` (well
+ * before the deadlock backstop), the orchestrator looks for a single
+ * qualifying parked idle robot standing in its way and commands it out of
+ * the way with an ordinary "yield" leg — routed and reservation-gated by
+ * the exact same machinery as any order leg, so the collision invariant is
+ * untouched. See `tryDispatchYield()`.
+ *
+ * Known accepted limitation (BACKLOG, not fixed here): yield dispatch
+ * targets ONE blocker at a time. A multi-robot CHAINED blockage — the
+ * yield target itself boxed in by a second parked robot, and so on — has
+ * no qualifying single-hop yield target and falls back to the deadlock
+ * backstop (`opts.blockedTicksLimit` consecutive fully-blocked ticks
+ * requeues the order; after 3 requeues OrderBook fails it outright) exactly
+ * as before yield dispatch existed — strictly no worse than pre-#13
+ * behavior.
  */
 export class Orchestrator {
   private readonly map: WarehouseMap;
@@ -152,6 +175,7 @@ export class Orchestrator {
   private readonly cycleTimes: number[] = [];
   private completions = 0;
   private tickCount = 0;
+  private yieldCounter = 0;
   private timer?: ReturnType<typeof setInterval>;
   private readonly startedAtMs: number;
 
@@ -163,6 +187,8 @@ export class Orchestrator {
       horizon: opts?.horizon ?? 5,
       offlineGraceMs: opts?.offlineGraceMs ?? 10_000,
       blockedTicksLimit: opts?.blockedTicksLimit ?? 20,
+      yieldAfterTicks: opts?.yieldAfterTicks ?? 6,
+      yieldCooldownTicks: opts?.yieldCooldownTicks ?? 20,
       now: opts?.now,
     };
     this.router = new PibtRouter(map);
@@ -432,6 +458,21 @@ export class Orchestrator {
   private handleMissionDone(robotId: RobotId, missionId: string): void {
     const rt = this.robots.get(robotId);
     if (!rt) return;
+
+    // #13: yield legs are handled entirely here, before parseMissionId /
+    // order-book logic — they never touch the order book at all. A yield
+    // missionId is `yield:${robotId}#${counter}`, which parseMissionId
+    // would reject anyway (no trailing ":pick"/":drop"), but intercepting
+    // explicitly here (rather than falling through to the unparseable-id
+    // branch below) lets a completed yield clear cleanly without logging a
+    // spurious "unparseable mission id" alarm.
+    if (rt.leg?.kind === "yield") {
+      if (rt.leg.missionId === missionId) {
+        setLeg(rt, undefined); // yield done (or harmlessly cut short)
+      }
+      return;
+    }
+
     const parsed = parseMissionId(missionId);
     if (!parsed) return;
     const { orderId, leg } = parsed;
@@ -575,6 +616,7 @@ export class Orchestrator {
         return; // stale/duplicate event for an order no longer in this state
       }
       setLeg(rt, {
+        kind: "order",
         orderId,
         phase: "drop",
         goalNode: order.dropNode,
@@ -600,6 +642,19 @@ export class Orchestrator {
   private handleMissionFailed(robotId: RobotId, missionId: string, reason: string): void {
     const rt = this.robots.get(robotId);
     if (!rt) return;
+
+    // #13: same yield short-circuit as handleMissionDone — a failed yield
+    // never touches the order book, just clears the leg.
+    if (rt.leg?.kind === "yield") {
+      if (rt.leg.missionId === missionId) {
+        setLeg(rt, undefined);
+        this.alarms.push(
+          `t=${this.tickCount} yield mission failed for robot ${robotId}: ${reason}`
+        );
+      }
+      return;
+    }
+
     const parsed = parseMissionId(missionId);
     if (!parsed) {
       // Can't even tell which order this was for; just stop this robot
@@ -804,6 +859,7 @@ export class Orchestrator {
       if (!rt || rt.currentNodeId === undefined) continue;
       rt.idleSinceTick = undefined;
       setLeg(rt, {
+        kind: "order",
         orderId: order.id,
         phase: "pick",
         goalNode: order.pickupNode,
@@ -828,13 +884,19 @@ export class Orchestrator {
    * cells and is checked (and only committed to on a full grant) on every
    * extension below, regardless of adapter cadence.
    *
-   * Known accepted limitation (BACKLOG, not fixed here): a parked IDLE
-   * robot sitting on the only path into an order's pickup/drop permanently
-   * owns that cell (see resolveCurrentNodes()) but is never itself
-   * commanded to move out of the way — PIBT only ever pushes it virtually.
-   * Such an order blocks forever until the deadlock backstop below
-   * requeues it, and after 3 requeues OrderBook fails it outright, rather
-   * than ever being routed around the parked robot.
+   * A parked IDLE robot sitting on the only path into an order's
+   * pickup/drop permanently owns that cell (see resolveCurrentNodes()) but
+   * is never itself commanded to move out of the way by PIBT — PIBT only
+   * ever pushes it virtually. Below, once a blocked ORDER leg's
+   * blockedTicks reaches `opts.yieldAfterTicks`, `tryDispatchYield()`
+   * mitigates this by commanding a single qualifying parked blocker out of
+   * the way (#13).
+   *
+   * Known accepted limitation (BACKLOG, not fixed here): yield dispatch
+   * only ever targets ONE blocker; a multi-robot chained blockage still
+   * falls back to the deadlock backstop below, which requeues the order,
+   * and after 3 requeues OrderBook fails it outright, rather than ever
+   * being routed around the parked robot(s).
    */
   private runRouting(): void {
     const agents: Agent[] = [];
@@ -907,6 +969,9 @@ export class Orchestrator {
               `t=${this.tickCount} contention: robot ${id} blocked at ${deniedCell} ` +
                 `(owner=${String(this.reservations.owner(deniedCell))}, blockedTicks=${leg.blockedTicks})`
             );
+            if (leg.kind === "order" && leg.blockedTicks === this.opts.yieldAfterTicks) {
+              this.tryDispatchYield(id, leg);
+            }
             if (leg.blockedTicks >= this.opts.blockedTicksLimit) {
               this.requeueBlockedLeg(id, rt, leg, deniedCell);
               continue;
@@ -930,6 +995,9 @@ export class Orchestrator {
             `t=${this.tickCount} contention: robot ${id} blocked at ${stuckCell} ` +
               `(no forward candidate, blockedTicks=${leg.blockedTicks})`
           );
+          if (leg.kind === "order" && leg.blockedTicks === this.opts.yieldAfterTicks) {
+            this.tryDispatchYield(id, leg);
+          }
           if (leg.blockedTicks >= this.opts.blockedTicksLimit) {
             this.requeueBlockedLeg(id, rt, leg, stuckCell);
             continue;
@@ -984,21 +1052,129 @@ export class Orchestrator {
    * sitting on — a genuine collision hole.
    */
   private requeueBlockedLeg(id: RobotId, rt: RobotRuntime, leg: RobotLeg, deniedCell: CellKey): void {
-    this.alarms.push(
-      `t=${this.tickCount} robot ${id} blocked ${leg.blockedTicks} ticks at ${deniedCell} — requeueing order ${leg.orderId}`
-    );
+    // #13: a blocked YIELD leg has no order to requeue — it was never in
+    // the order book to begin with (see tryDispatchYield). Log distinctly
+    // ("abandoning yield" vs "requeueing order") so alarm text never
+    // implies an order was affected when none was; cancel/releaseAll/
+    // own-cell re-claim/clear stay identical for both leg kinds.
+    if (leg.kind === "order") {
+      this.alarms.push(
+        `t=${this.tickCount} robot ${id} blocked ${leg.blockedTicks} ticks at ${deniedCell} — requeueing order ${leg.orderId}`
+      );
+      try {
+        this.book.requeue(leg.orderId, "sustained reservation contention");
+      } catch {
+        /* already terminal */
+      }
+    } else {
+      this.alarms.push(
+        `t=${this.tickCount} robot ${id} blocked ${leg.blockedTicks} ticks at ${deniedCell} — abandoning yield`
+      );
+    }
     void this.adapter.cancelMission(id).catch(() => {
       /* best-effort */
     });
-    try {
-      this.book.requeue(leg.orderId, "sustained reservation contention");
-    } catch {
-      /* already terminal */
-    }
     this.reservations.releaseAll(id);
     if (rt.currentNodeId !== undefined) {
       this.reservations.claim(id, [cellKey(this.map.node(rt.currentNodeId).pos)]);
     }
     setLeg(rt, undefined);
+  }
+
+  /**
+   * #13 yield dispatch: when an ORDER leg has been blocked for
+   * yieldAfterTicks, look for a parked idle robot standing on the first
+   * cell the blocked robot needs next, and command it out of the way with
+   * a yield leg — an ordinary leg (kind "yield") with no order attached,
+   * routed and reservation-gated by the same machinery as any other leg.
+   * Returns true if a yield was dispatched this tick.
+   */
+  private tryDispatchYield(blockedId: RobotId, blockedLeg: RobotLeg): boolean {
+    // 1. The cell the blocked robot needs: its frontier's neighbors sorted
+    //    by distance to the leg goal — first one owned by a QUALIFYING
+    //    blocker (online, not quarantined, leg-less, resolved node, not
+    //    itself the blocked robot, cooldown expired) wins.
+    const frontier = blockedLeg.nodeIds[blockedLeg.nodeIds.length - 1]!;
+    const wanted = [...this.map.neighbors(frontier)].sort(
+      (a, b) => this.map.distance(a, blockedLeg.goalNode) - this.map.distance(b, blockedLeg.goalNode)
+    );
+    for (const nodeId of wanted) {
+      const cell = cellKey(this.map.node(nodeId).pos);
+      const ownerId = this.reservations.owner(cell);
+      if (ownerId === undefined || ownerId === blockedId) continue;
+      const blocker = this.robots.get(ownerId);
+      if (
+        !blocker ||
+        blocker.leg ||
+        blocker.quarantined ||
+        !blocker.online ||
+        blocker.currentNodeId === undefined ||
+        (blocker.lastYieldTick !== undefined &&
+          this.tickCount - blocker.lastYieldTick < this.opts.yieldCooldownTicks)
+      ) {
+        continue;
+      }
+      const target = this.findYieldTarget(ownerId, blocker.currentNodeId, nodeId);
+      if (target === undefined) continue;
+      blocker.lastYieldTick = this.tickCount;
+      this.yieldCounter++;
+      setLeg(blocker, {
+        kind: "yield",
+        orderId: "",
+        phase: "pick",
+        goalNode: target,
+        missionId: `yield:${ownerId}#${this.yieldCounter}`,
+        nodeIds: [blocker.currentNodeId],
+        sent: false,
+        progressIndex: 0,
+        blockedTicks: 0,
+      });
+      this.alarms.push(
+        `t=${this.tickCount} yield: robot ${ownerId} at ${nodeId} asked to vacate to ${target} (blocking ${blockedId})`
+      );
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * BFS from the blocker's node (depth cap 10) for the nearest node whose
+   * cell is unowned (or the blocker's own), not physically occupied by any
+   * robot, and not the cell being vacated. Undefined when nothing suitable
+   * is reachable.
+   */
+  private findYieldTarget(
+    blockerId: RobotId,
+    from: string,
+    vacating: string
+  ): string | undefined {
+    const occupiedNodes = new Set<string>();
+    for (const [, rt] of this.robots) {
+      if (rt.currentNodeId !== undefined) occupiedNodes.add(rt.currentNodeId);
+    }
+    const seen = new Set<string>([from]);
+    let frontier = [from];
+    for (let depth = 0; depth < 10; depth++) {
+      const next: string[] = [];
+      for (const nodeId of frontier) {
+        for (const nb of this.map.neighbors(nodeId)) {
+          if (seen.has(nb)) continue;
+          seen.add(nb);
+          const cell = cellKey(this.map.node(nb).pos);
+          const ownerId = this.reservations.owner(cell);
+          if (
+            nb !== vacating &&
+            nb !== from &&
+            !occupiedNodes.has(nb) &&
+            (ownerId === undefined || ownerId === blockerId)
+          ) {
+            return nb;
+          }
+          next.push(nb);
+        }
+      }
+      frontier = next;
+    }
+    return undefined;
   }
 }

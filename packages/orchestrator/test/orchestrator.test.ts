@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { WarehouseMap } from "@tez/core";
 import { FakeAdapter } from "@tez/robot-interface";
 import type { AdapterEvent, Mission } from "@tez/robot-interface";
-import type { RobotId, RobotState } from "@tez/shared";
+import type { RobotId, RobotState, CellKey } from "@tez/shared";
 import { cellKey } from "@tez/shared";
 import { Orchestrator } from "../src/orchestrator.js";
 
@@ -1498,6 +1498,138 @@ describe("Orchestrator", () => {
         completed = orch.snapshot().orders.find((o) => o.id === order.id)?.status === "completed";
       }
       expect(completed).toBe(true);
+    });
+  });
+
+  describe("yield dispatch (#13)", () => {
+    it("a parked idle robot yields out of the only corridor and the order completes", () => {
+      // 3x1 corridor: r1 at n0_0 must reach n2_0; r2 idle parked at n1_0.
+      // 3x1 has NO side-step cell, so use 3x2: r2 can yield to n1_1.
+      const map = WarehouseMap.fromJSON(WarehouseMap.grid(3, 2));
+      const adapter = new FakeAdapter(
+        [
+          { id: "r1" as RobotId, startNodeId: "n0_0" },
+          { id: "r2" as RobotId, startNodeId: "n1_0" },
+        ],
+        map
+      );
+      const orch = new Orchestrator(map, adapter, {
+        horizon: 3,
+        yieldAfterTicks: 3,
+        blockedTicksLimit: 30, // backstop far away: yield must be what resolves this
+      });
+      adapter.tick();
+      orch.tickOnce();
+      // r2 must NOT take the order: dispatch is distance-based Hungarian, so
+      // submit the order pickup at r1's own cell (distance 0). r1's pick leg
+      // completes instantly (already there), then the DROP leg n0_0->n2_0
+      // must cross r2 at n1_0.
+      const order = orch.submitOrder("n0_0", "n2_0");
+      let completed = false;
+      for (let i = 0; i < 120 && !completed; i++) {
+        adapter.tick();
+        orch.tickOnce();
+        completed =
+          orch.snapshot().orders.find((o) => o.id === order.id)?.status === "completed";
+      }
+      expect(completed).toBe(true);
+      const alarms = orch.getAlarms();
+      expect(alarms.some((a) => a.includes("yield"))).toBe(true);
+      // The yield must have resolved it BEFORE any backstop requeue:
+      expect(alarms.some((a) => a.includes("requeueing order"))).toBe(false);
+      // r2 ended up somewhere, still owns its own cell (invariant):
+      const r2 = adapter.robots().find((r) => r.id === "r2")!;
+      const r2cell: CellKey = cellKey(r2.pos);
+      expect(orch._reservationOwner(r2cell)).toBe("r2");
+    });
+
+    it("yield legs never touch the order book and clear on completion", () => {
+      // Same corridor setup as above: r1's drop leg must cross r2 parked at
+      // n1_0, forcing a yield.
+      const map = WarehouseMap.fromJSON(WarehouseMap.grid(3, 2));
+      const adapter = new FakeAdapter(
+        [
+          { id: "r1" as RobotId, startNodeId: "n0_0" },
+          { id: "r2" as RobotId, startNodeId: "n1_0" },
+        ],
+        map
+      );
+      const orch = new Orchestrator(map, adapter, {
+        horizon: 3,
+        yieldAfterTicks: 3,
+        blockedTicksLimit: 30,
+      });
+      adapter.tick();
+      orch.tickOnce();
+      const order = orch.submitOrder("n0_0", "n2_0");
+      let completed = false;
+      for (let i = 0; i < 120 && !completed; i++) {
+        adapter.tick();
+        orch.tickOnce();
+        completed =
+          orch.snapshot().orders.find((o) => o.id === order.id)?.status === "completed";
+      }
+      expect(completed).toBe(true);
+      const alarms = orch.getAlarms();
+      expect(alarms.some((a) => a.includes("yield"))).toBe(true);
+
+      // The yield leg never touched the order book: r2 never became this
+      // order's robot.
+      const finalOrder = orch.snapshot().orders.find((o) => o.id === order.id)!;
+      expect(finalOrder.robotId).toBe("r1");
+
+      // r2's leg is cleared at the end: it's dispatchable again. Submit a
+      // fresh order pinned exactly at r2's current cell (distance 0, so
+      // Hungarian must assign it to r2 regardless of where r2 ended up) and
+      // confirm r2 takes and completes it.
+      const r2 = adapter.robots().find((r) => r.id === "r2")!;
+      const r2NodeId = `n${r2.pos.x}_${r2.pos.y}`;
+      const otherNode = map.nodeIds.find((n) => n !== r2NodeId)!;
+      const order2 = orch.submitOrder(r2NodeId, otherNode);
+      let completed2 = false;
+      for (let i = 0; i < 60 && !completed2; i++) {
+        adapter.tick();
+        orch.tickOnce();
+        completed2 =
+          orch.snapshot().orders.find((o) => o.id === order2.id)?.status === "completed";
+      }
+      expect(completed2).toBe(true);
+      expect(orch.snapshot().orders.find((o) => o.id === order2.id)?.robotId).toBe("r2");
+    });
+
+    it("no qualifying blocker means no yield and the backstop still fires", () => {
+      // Blocker is OFFLINE (setConnection(false) after registration): yield
+      // must NOT be dispatched to an offline robot; order eventually fails
+      // via backstop (blockedTicksLimit small) — the strictly-better
+      // property: behavior degrades to pre-yield behavior, never worse.
+      const map = WarehouseMap.fromJSON(WarehouseMap.grid(3, 2));
+      const adapter = new FakeAdapter(
+        [
+          { id: "r1" as RobotId, startNodeId: "n0_0" },
+          { id: "r2" as RobotId, startNodeId: "n1_0" },
+        ],
+        map
+      );
+      const orch = new Orchestrator(map, adapter, {
+        horizon: 3,
+        yieldAfterTicks: 3,
+        blockedTicksLimit: 5,
+      });
+      adapter.tick();
+      orch.tickOnce();
+      adapter.setConnection("r2" as RobotId, false);
+      orch.tickOnce();
+      const order = orch.submitOrder("n0_0", "n2_0");
+      let terminal = false;
+      for (let i = 0; i < 60 && !terminal; i++) {
+        adapter.tick();
+        orch.tickOnce();
+        terminal = orch.snapshot().orders.find((o) => o.id === order.id)?.status === "failed";
+      }
+      expect(terminal).toBe(true);
+      const alarms = orch.getAlarms();
+      expect(alarms.some((a) => a.includes("yield") && a.includes("r2"))).toBe(false);
+      expect(alarms.some((a) => a.includes("requeueing order"))).toBe(true);
     });
   });
 });
