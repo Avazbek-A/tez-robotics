@@ -37,6 +37,35 @@ npm install
 npm run dev
 ```
 
+## Live demo: API + dashboard (`packages/api`, `packages/dashboard`)
+
+One command boots the real orchestrator behind a Fastify API, streaming live fleet state to a React/Pixi cockpit dashboard:
+
+```bash
+corepack pnpm install
+corepack pnpm demo
+```
+
+This builds `@tez/api`, starts it in `DEMO` mode (an in-memory `FakeAdapter` fleet — no MQTT broker or physical robots needed), starts the dashboard's Vite dev server, and seeds a handful of demo orders on a stagger:
+
+- **Dashboard:** http://localhost:5173
+- **API:** http://localhost:8080 (`/health`, `/map`, `/orders`, `/kpi`, `/ws/state`, `/docs` for OpenAPI)
+
+Persisted order/KPI history uses an in-memory pglite instance by default. Env vars:
+
+- `PGLITE_DIR` — set to a filesystem path to persist history across restarts instead of the `"memory"` default
+- `DEMO` / `PORT` / `TICK_MS` / `ROBOTS` — forwarded to the api; `pnpm demo` sets sane demo defaults itself, override by exporting before running
+
+`Ctrl-C` tears down both the api and dashboard processes.
+
+### `pnpm demo:vda` (best-effort)
+
+```bash
+corepack pnpm demo:vda
+```
+
+Same dashboard, but the api runs in real VDA 5050 mode against a local dev MQTT broker, with a 3-robot simulated fleet (`@tez/sim`) speaking the actual protocol instead of `FakeAdapter`. This path is **best-effort**: it depends on a dev MQTT broker and a simulated fleet process that can fail to start independently of the api/dashboard (see [`docs/BACKLOG.md`](docs/BACKLOG.md) for the known gaps — e.g. the sim fleet's AGV ids don't line up with the api's own robot ids yet). If the sim fleet fails to spawn, the api and dashboard still come up; you'll just see an empty fleet until robots connect.
+
 ## Why robots + local software
 
 - Uzbekistan's e-commerce and distribution are growing fast; warehouses still run on foot while the workforce emigrates
