@@ -14,7 +14,14 @@ export interface AlarmDrawerProps {
  * header.
  */
 export function AlarmDrawer({ alarms }: AlarmDrawerProps) {
+  // See App.tsx's ConnectionChip: `t` alone is a stable closure reference
+  // that never changes identity on lang switch, so a `t`-only selector never
+  // re-renders this component when lang changes. Also selecting `lang`
+  // forces the re-render; `t` then reads the fresh lang when called during
+  // that render.
+  const lang = useI18n((s) => s.lang);
   const t = useI18n((s) => s.t);
+  void lang; // subscription-only: forces re-render, not read directly
   const [open, setOpen] = useState(false);
   const newestFirst = [...alarms].reverse();
 

@@ -17,7 +17,9 @@ const ALARMS_TAIL = 100;
 
 export interface StateFrame {
   t: string; // ISO timestamp
-  seq: number; // per-connection increasing
+  seq: number; // per-connection increasing; NOT contiguous across reconnects
+  // (late joiners share the server's global counter, so a second frame can
+  // jump far ahead of the first frame's seq=0)
   degraded: boolean; // false in v1
   robots: RobotState[];
   orders: TransportOrder[];
@@ -66,7 +68,9 @@ export async function wsRoutes(app: FastifyInstance, opts: WsRouteOpts): Promise
     const frame = makeFrame(system, seq);
     const payload = JSON.stringify(frame);
     for (const socket of sockets) {
-      socket.send(payload);
+      if (socket.readyState === socket.OPEN) {
+        socket.send(payload);
+      }
     }
   }, FRAME_MS);
   timer.unref();

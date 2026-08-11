@@ -25,4 +25,13 @@ describe("loadConfig", () => {
     expect(() => loadConfig({ DEMO: "0" })).toThrow(/MQTT_URL/);
     expect(loadConfig({ DEV_BROKER: "1" }).devBroker).toBe(true);
   });
+
+  it("rejects zero and negative PORT/TICK_MS/ROBOTS", () => {
+    expect(() => loadConfig({ PORT: "0", DEV_BROKER: "1" })).toThrow(/PORT/);
+    expect(() => loadConfig({ PORT: "-5", DEV_BROKER: "1" })).toThrow(/PORT/);
+    expect(() => loadConfig({ TICK_MS: "0", DEV_BROKER: "1" })).toThrow(/TICK_MS/);
+    expect(() => loadConfig({ TICK_MS: "-5", DEV_BROKER: "1" })).toThrow(/TICK_MS/);
+    expect(() => loadConfig({ ROBOTS: "0", DEV_BROKER: "1" })).toThrow(/ROBOTS/);
+    expect(() => loadConfig({ ROBOTS: "-5", DEV_BROKER: "1" })).toThrow(/ROBOTS/);
+  });
 });

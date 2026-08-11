@@ -34,7 +34,14 @@ export interface RobotCardProps {
  * clicking the same robot on the map behave identically.
  */
 export function RobotCard({ robot, currentOrder, selected, onSelect }: RobotCardProps) {
+  // See App.tsx's ConnectionChip: `t` alone is a stable closure reference
+  // that never changes identity on lang switch, so a `t`-only selector never
+  // re-renders this component when lang changes. Also selecting `lang`
+  // forces the re-render; `t` then reads the fresh lang when called during
+  // that render.
+  const lang = useI18n((s) => s.lang);
   const t = useI18n((s) => s.t);
+  void lang; // subscription-only: forces re-render, not read directly
   const color = ROBOT_STATUS_COLORS[robot.status] ?? ROBOT_STATUS_COLORS.UNKNOWN;
   const batteryPct = Math.round(Math.max(0, Math.min(1, robot.battery)) * 100);
 

@@ -136,12 +136,25 @@ function AnalyticsChart({
  * charts still show a live sparkline instead of going empty.
  */
 export function AnalyticsTab() {
+  // See App.tsx's ConnectionChip: `t` alone is a stable closure reference
+  // that never changes identity on lang switch, so a `t`-only selector never
+  // re-renders this component when lang changes. Also selecting `lang`
+  // forces the re-render; `t` then reads the fresh lang when called during
+  // that render.
+  const lang = useI18n((s) => s.lang);
   const t = useI18n((s) => s.t);
+  void lang; // subscription-only: forces re-render, not read directly
   const { range, note } = useKpiRange();
   const kpiBuffer = useFleetStore((s) => s.kpiBuffer);
 
   const data = useMemo<ChartPoint[]>(() => {
-    if (range) {
+    // `range && range.length > 0` (not just `range`): an empty array is a
+    // legitimate response (persistence on, but no kpi_snapshots rows yet —
+    // e.g. fresh boot, before the recorder's first snapshotEveryMs tick) and
+    // `[]` is truthy, so a bare `if (range)` would treat it as "authoritative
+    // empty data" and render blank charts instead of falling back to the
+    // live kpiBuffer sparkline below.
+    if (range && range.length > 0) {
       return range.map((row) => ({
         t: new Date(row.at).getTime(),
         ordersPerHour: row.orders_per_hour,

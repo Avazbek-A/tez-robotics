@@ -106,6 +106,55 @@ describe("GET /kpi?from= without repos", () => {
   });
 });
 
+describe("recorder: snapshot retention pruning", () => {
+  it("prunes state_snapshots rows older than the retention window; fresh rows remain", async () => {
+    const sys4 = await buildSystem(loadConfig({ DEMO: "1", TICK_MS: "10" }));
+    await sys4.start();
+
+    const driver4 = await createPgliteDriver();
+    await migrate(driver4);
+    const repos4 = createRepos(driver4);
+
+    const RETENTION_MS = 24 * 3600 * 1000;
+    const oldIso = new Date(Date.now() - 2 * 24 * 3600 * 1000).toISOString();
+    await repos4.snapshots.insertState(oldIso, {
+      robots: [],
+      orders: [],
+      kpis: { ordersPerHour: 0, avgCycleMs: 0, utilization: 0 },
+    });
+
+    // Sanity: the pre-seeded old row is actually there before the recorder
+    // (and its prune loop) starts.
+    const before = await driver4.query("select count(*)::int as n from state_snapshots", []);
+    expect((before.rows[0] as { n: number }).n).toBe(1);
+
+    // Tiny pruneEveryMs/snapshotEveryMs so both the recorder's synchronous
+    // first prune (on start, see recorder.ts) and its first fresh
+    // snapshot write land within this test's wait window.
+    const recorder4 = startRecorder(sys4, repos4, {
+      snapshotEveryMs: 50,
+      pruneEveryMs: 50,
+      retentionMs: RETENTION_MS,
+    });
+
+    await new Promise((r) => setTimeout(r, 300));
+
+    const after = await driver4.query("select at from state_snapshots order by at asc", []);
+    // Fresh rows from the recorder's own poll() writes are present...
+    expect(after.rows.length).toBeGreaterThan(0);
+    // ...and none of them is the stale, pre-seeded 2-day-old row (or any
+    // other row older than the retention window).
+    const cutoff = Date.now() - RETENTION_MS;
+    for (const row of after.rows) {
+      expect(new Date((row as { at: string }).at).getTime()).toBeGreaterThan(cutoff);
+    }
+
+    recorder4.stop();
+    await sys4.stop();
+    await driver4.close();
+  });
+});
+
 describe("api works fully with NO repos", () => {
   it("GET /health still returns 200 and GET /orders?history=1 still works (in-memory history)", async () => {
     const sys3 = await buildSystem(loadConfig({ DEMO: "1", TICK_MS: "10" }));

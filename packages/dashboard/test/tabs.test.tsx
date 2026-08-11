@@ -283,4 +283,42 @@ describe("AnalyticsTab", () => {
       expect(screen.getByText("Orders / hour")).toBeInTheDocument();
     });
   });
+
+  it("falls back to the live kpiBuffer sparkline when range is an empty array (persistence on, no rows yet)", async () => {
+    for (let i = 0; i < 3; i++) {
+      fleetStore.getState().applyFrame(makeFrame([]));
+    }
+    expect(fleetStore.getState().kpiBuffer.length).toBeGreaterThan(0);
+
+    // `range: []` (as opposed to `range: null`) is what the server sends
+    // when persistence is on but kpi_snapshots has no rows in range yet
+    // (e.g. fresh boot). `[]` is truthy, so the buggy `if (range)` check
+    // this test guards against would treat it as authoritative — empty —
+    // data and render blank charts instead of falling back.
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ live: { ordersPerHour: 0, avgCycleMs: 0, utilization: 0 }, range: [] }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<AnalyticsTab />);
+
+    // The `range` state starts `null` (request in flight), and while it's
+    // `null` *both* the buggy `if (range)` and the fixed
+    // `if (range && range.length > 0)` fall through to the kpiBuffer
+    // fallback identically — so asserting on ticks right after mount would
+    // pass regardless of the bug. Explicitly wait for the GET /kpi
+    // round-trip to be issued, then flush the `res.json()` + `setRange([])`
+    // microtasks with an empty `act`, so the assertion below observes the
+    // *settled* post-fetch render — where the bug and the fix actually
+    // diverge (bug: range=[] is treated as authoritative → data=[] → 0
+    // ticks; fix: falls through to the non-empty kpiBuffer → ticks render).
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringMatching(/^\/kpi\?/)));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(document.querySelectorAll(".recharts-cartesian-axis-tick").length).toBeGreaterThan(0);
+  });
 });
