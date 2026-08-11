@@ -11,6 +11,8 @@
   "dependencies": {
     "@fontsource/ibm-plex-sans": "^5.1.0",
     "@fontsource/jetbrains-mono": "^5.1.0",
+    "pixi-viewport": "^6.0.3",
+    "pixi.js": "^8.19.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "zustand": "^4.5.5"

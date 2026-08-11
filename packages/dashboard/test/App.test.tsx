@@ -1,7 +1,16 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import App from "../src/App";
 import { useI18n } from "../src/i18n";
+
+// The Pixi map mounts a WebGL/Canvas Application on the Cockpit tab, which
+// happy-dom cannot back (no real GPU/canvas context) — see task-11 brief:
+// "Pixi/DOM layer excluded from vitest". App's tab-switching/i18n behavior
+// under test here doesn't depend on what's inside the Cockpit panel, so the
+// map is stubbed out.
+vi.mock("../src/map/PixiMap", () => ({
+  default: () => <div data-testid="pixi-map-stub" />,
+}));
 
 describe("App language switching (render-based)", () => {
   beforeEach(() => {

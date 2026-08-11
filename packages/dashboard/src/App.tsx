@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { useI18n } from "./i18n";
 import type { Lang } from "./i18n";
+import PixiMap from "./map/PixiMap";
 
 type Tab = "cockpit" | "orders" | "analytics";
 
@@ -113,7 +114,14 @@ export default function App() {
       <TabBar />
 
       <main className="flex-1 p-4">
-        {tab === "cockpit" && <section aria-label="Cockpit" />}
+        {tab === "cockpit" && (
+          <section
+            aria-label="Cockpit"
+            className="h-[calc(100vh-8.5rem)] overflow-hidden rounded-lg border border-white/10 bg-[var(--surface-1)]"
+          >
+            <PixiMap />
+          </section>
+        )}
         {tab === "orders" && <section aria-label="Orders" />}
         {tab === "analytics" && <section aria-label="Analytics" />}
       </main>
