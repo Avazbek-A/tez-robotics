@@ -17,7 +17,15 @@ export const useUiStore = create<UiState>((set) => ({
 const LANGS: Lang[] = ["ru", "uz", "en"];
 
 function ConnectionChip() {
+  // `t` alone is a stable closure reference (it never changes identity
+  // when lang changes — it reads current lang via `get()` internally),
+  // so a selector on `t` alone never re-renders this component on lang
+  // switch. Also selecting `lang` (a primitive, so reference-equality
+  // works fine) forces the re-render whenever it differs; `t` then
+  // reads the fresh lang when called during that render.
+  const lang = useI18n((s) => s.lang);
   const t = useI18n((s) => s.t);
+  void lang; // subscription-only: forces re-render, not read directly
   // Placeholder pending the WS client (later task): shows "reconnecting"
   // state until the real /ws connection is wired up.
   return (
@@ -62,7 +70,11 @@ const TABS: { key: Tab; labelKey: "tabCockpit" | "tabOrders" | "tabAnalytics" }[
 function TabBar() {
   const tab = useUiStore((s) => s.tab);
   const setTab = useUiStore((s) => s.setTab);
+  // See ConnectionChip above: also select `lang` so this component
+  // re-renders on lang switch (a `t`-only selector never does).
+  const lang = useI18n((s) => s.lang);
   const t = useI18n((s) => s.t);
+  void lang; // subscription-only: forces re-render, not read directly
 
   return (
     <nav className="flex gap-1 border-b border-white/10 px-4" aria-label="Sections">
