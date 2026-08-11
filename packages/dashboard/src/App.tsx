@@ -151,7 +151,7 @@ function CockpitBottomStrip() {
   const queueDepth = orders.filter((o) => o.status === "queued").length;
 
   return (
-    <div className="grid h-full grid-cols-1 gap-4 overflow-hidden sm:grid-cols-[1fr_auto]">
+    <div className="grid h-full min-h-0 grid-cols-1 gap-4 overflow-hidden sm:grid-cols-[1fr_auto]">
       <TaskQueue orders={orders} />
       <div className="border-t border-white/10 pt-2 sm:border-l sm:border-t-0 sm:pl-4 sm:pt-0">
         <KpiRow
@@ -194,7 +194,7 @@ function Cockpit() {
       </div>
       <div
         style={{ gridArea: "bottom" }}
-        className="overflow-hidden rounded-lg border border-white/10 bg-[var(--surface-1)] p-3"
+        className="min-h-0 overflow-hidden rounded-lg border border-white/10 bg-[var(--surface-1)] p-3"
       >
         <CockpitBottomStrip />
       </div>

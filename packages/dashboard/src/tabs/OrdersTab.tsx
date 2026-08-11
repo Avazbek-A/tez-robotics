@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { useI18n } from "../i18n";
+import { useI18n, localeFor } from "../i18n";
 import { useFleetStore } from "../store";
 import { ORDER_STATUS_COLORS } from "../status-colors";
 import { Badge } from "../components/ui/badge";
@@ -64,6 +64,7 @@ function HistoryTimeline({
   loading: boolean;
 }) {
   const t = useI18n((s) => s.t);
+  const lang = useI18n((s) => s.lang);
 
   if (loading) {
     return <p className="py-2 text-xs text-[var(--text)]/50">{t("historyLoading")}</p>;
@@ -80,7 +81,7 @@ function HistoryTimeline({
           className="flex flex-wrap items-center gap-2 text-xs text-[var(--text)]/70"
         >
           <span className="font-mono-num text-[var(--text)]/50">
-            {new Date(entry.at).toLocaleString()}
+            {new Date(entry.at).toLocaleString(localeFor(lang))}
           </span>
           {isDbHistoryEntry(entry) ? (
             <>
@@ -132,6 +133,7 @@ function historyCacheKey(order: TransportOrder): string {
  */
 export function OrdersTab() {
   const t = useI18n((s) => s.t);
+  const lang = useI18n((s) => s.lang);
   const orders = useFleetStore((s) => s.frame?.orders ?? []);
 
   const [statusFilter, setStatusFilter] = useState<TransportOrder["status"] | "all">("all");
@@ -248,6 +250,7 @@ export function OrdersTab() {
                 historyEntries={historyCache[historyCacheKey(order)]}
                 loading={loadingId === order.id}
                 t={t}
+                locale={localeFor(lang)}
               />
             ))}
           </tbody>
@@ -264,6 +267,7 @@ function OrderRow({
   historyEntries,
   loading,
   t,
+  locale,
 }: {
   order: TransportOrder;
   expanded: boolean;
@@ -271,6 +275,7 @@ function OrderRow({
   historyEntries: OrderHistoryEntry[] | undefined;
   loading: boolean;
   t: (key: string) => string;
+  locale: string;
 }) {
   return (
     <>
@@ -290,7 +295,7 @@ function OrderRow({
         <td className="px-3 py-2 font-mono-num text-[var(--text)]/70">{order.robotId ?? "—"}</td>
         <td className="px-3 py-2 font-mono-num">{order.retries}</td>
         <td className="px-3 py-2 font-mono-num text-[var(--text)]/70">
-          {new Date(order.createdAt).toLocaleString()}
+          {new Date(order.createdAt).toLocaleString(locale)}
         </td>
       </tr>
       {expanded && (

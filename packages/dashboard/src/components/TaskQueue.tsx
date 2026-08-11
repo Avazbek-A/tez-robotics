@@ -84,7 +84,7 @@ export function TaskQueue({ orders }: TaskQueueProps) {
   }
 
   return (
-    <div className="flex h-full flex-col gap-2">
+    <div className="flex h-full min-h-0 flex-col gap-2">
       <div className="flex items-center justify-between">
         <h2 className="text-xs font-semibold uppercase tracking-wide text-[var(--text)]/60">
           {t("taskQueueTitle")}
@@ -96,7 +96,13 @@ export function TaskQueue({ orders }: TaskQueueProps) {
 
       {error && <div className="text-xs text-[#ef4444]">{error}</div>}
 
-      <div className="flex-1 space-y-1 overflow-y-auto">
+      {/* min-h-0 is load-bearing: without it a flex/grid child with flex-1
+          keeps its content-driven min-height (the "auto" default), so it
+          never actually shrinks to the bottom strip's fixed height — the
+          ancestor's overflow-hidden then hard-clips the last row instead
+          of this element scrolling. pb-2 keeps the final row's bottom
+          border clear of the strip edge once scrolling does kick in. */}
+      <div className="min-h-0 flex-1 space-y-1 overflow-y-auto pb-2">
         {sorted.length === 0 && (
           <div className="py-2 text-xs text-[var(--text)]/50">{t("noOrders")}</div>
         )}

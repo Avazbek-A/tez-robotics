@@ -189,6 +189,18 @@ export const STRINGS: Record<Lang, Record<string, string>> = {
   },
 };
 
+/** BCP-47 locale tag for date/number formatting (Intl / toLocale*). */
+const LOCALE_BY_LANG: Record<Lang, string> = {
+  ru: "ru-RU",
+  uz: "uz-UZ",
+  en: "en-US",
+};
+
+/** Maps the UI language to the BCP-47 locale for `toLocaleString`/`Intl`. */
+export function localeFor(lang: Lang): string {
+  return LOCALE_BY_LANG[lang];
+}
+
 interface I18nState {
   lang: Lang;
   setLang: (lang: Lang) => void;

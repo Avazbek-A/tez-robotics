@@ -76,6 +76,26 @@ describe("map + kpi", () => {
     expect(typeof body.live.utilization).toBe("number");
   });
 
+  it("GET /kpi?from= with a malformed timestamp returns 400 {error} instead of a raw pg error", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/kpi?from=2026-08-11T06:30:20.817943 00:00",
+    });
+    expect(res.statusCode).toBe(400);
+    const body = res.json();
+    expect(body).toEqual({ error: "invalid from/to timestamp" });
+  });
+
+  it("GET /kpi?from=<valid>&to=<malformed> also returns 400 {error} (to is validated too)", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/kpi?from=2026-01-01T00:00:00.000Z&to=not-a-date",
+    });
+    expect(res.statusCode).toBe(400);
+    const body = res.json();
+    expect(body).toEqual({ error: "invalid from/to timestamp" });
+  });
+
   it("GET /docs/json serves the OpenAPI document", async () => {
     const res = await app.inject({ method: "GET", url: "/docs/json" });
     expect(res.statusCode).toBe(200);

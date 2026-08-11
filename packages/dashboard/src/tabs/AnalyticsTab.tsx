@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { useI18n } from "../i18n";
+import { useI18n, localeFor } from "../i18n";
 import { useFleetStore } from "../store";
 
 /**
@@ -33,8 +33,8 @@ interface ChartPoint {
 const RANGE_MS = 60 * 60 * 1000; // last hour, per brief
 const REFETCH_MS = 30_000;
 
-function formatTime(t: number): string {
-  return new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+function formatTime(t: number, locale: string): string {
+  return new Date(t).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" });
 }
 
 /**
@@ -89,6 +89,8 @@ function AnalyticsChart({
   color: string;
   valueFormatter: (v: number) => string;
 }) {
+  const lang = useI18n((s) => s.lang);
+  const locale = localeFor(lang);
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-white/10 bg-[var(--surface-1)] p-3">
       <h3 className="text-xs font-semibold uppercase tracking-wide text-[var(--text)]/60">{title}</h3>
@@ -104,7 +106,7 @@ function AnalyticsChart({
             <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.08)" />
             <XAxis
               dataKey="t"
-              tickFormatter={formatTime}
+              tickFormatter={(t) => formatTime(t, locale)}
               tick={{ fontSize: 10, fill: "rgba(255,255,255,0.5)" }}
               minTickGap={40}
             />
@@ -114,7 +116,7 @@ function AnalyticsChart({
               width={40}
             />
             <Tooltip
-              labelFormatter={(v) => formatTime(Number(v))}
+              labelFormatter={(v) => formatTime(Number(v), locale)}
               formatter={(value) => valueFormatter(Number(value))}
             />
             <Area type="monotone" dataKey={dataKey} stroke={color} fill={`url(#fill-${dataKey})`} />

@@ -41,6 +41,10 @@ const KpiResponse = Type.Object({
   note: Type.Optional(Type.String()),
 });
 
+const ErrorResponse = Type.Object({
+  error: Type.String(),
+});
+
 /**
  * Fastify plugin registering GET /kpi. Always returns the orchestrator's
  * in-memory `live` snapshot (system.orchestrator.snapshot().kpis). When
@@ -59,15 +63,24 @@ export async function kpiRoutes(app: FastifyInstance, opts: KpiRouteOpts): Promi
         querystring: KpiQuery,
         response: {
           200: KpiResponse,
+          400: ErrorResponse,
         },
       },
     },
-    async (request) => {
+    async (request, reply) => {
       const { kpis } = system.orchestrator.snapshot();
       const { from, to } = request.query;
 
       if (from === undefined) {
         return { live: kpis };
+      }
+      // pg rejects unparseable timestamps with a raw driver error (500,
+      // code 22007) — validate here so malformed/unencoded query values
+      // (e.g. a literal "+" in an ISO offset arriving as a space) surface
+      // as a normal 400 instead of a passthrough 500.
+      if (Number.isNaN(Date.parse(from)) || (to !== undefined && Number.isNaN(Date.parse(to)))) {
+        reply.code(400);
+        return { error: "invalid from/to timestamp" };
       }
       if (!repos) {
         return { live: kpis, range: null, note: "persistence disabled" };

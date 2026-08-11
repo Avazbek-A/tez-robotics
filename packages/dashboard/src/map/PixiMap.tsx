@@ -7,6 +7,28 @@ import type { Renderer, RawMapLike } from "./renderer";
 
 const MIN_ZOOM = 0.25;
 const MAX_ZOOM = 4;
+const FIT_PADDING_PX = 48;
+
+/**
+ * Scale + center the viewport so `bounds` (world px) fits inside a
+ * `screenWidth`x`screenHeight` viewport with `FIT_PADDING_PX` of breathing
+ * room on every side, clamped to [MIN_ZOOM, MAX_ZOOM]. Used both on initial
+ * load and on container resize (as long as the user hasn't taken the
+ * camera themselves — see `userInteracted` in the effect below).
+ */
+function fitToBounds(
+  viewport: Viewport,
+  bounds: { minX: number; minY: number; maxX: number; maxY: number; width: number; height: number },
+  screenWidth: number,
+  screenHeight: number,
+): void {
+  const availableWidth = Math.max(1, screenWidth - FIT_PADDING_PX * 2);
+  const availableHeight = Math.max(1, screenHeight - FIT_PADDING_PX * 2);
+  const rawScale = Math.min(availableWidth / bounds.width, availableHeight / bounds.height);
+  const scale = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, rawScale));
+  viewport.setZoom(scale, false);
+  viewport.moveCenter((bounds.minX + bounds.maxX) / 2, (bounds.minY + bounds.maxY) / 2);
+}
 
 /**
  * Live fleet map. Pixi v8 canvas + pixi-viewport pan/zoom, driven directly
@@ -28,6 +50,10 @@ export default function PixiMap() {
     let renderer: Renderer | null = null;
     let resizeObserver: ResizeObserver | null = null;
     let unsubscribe: (() => void) | null = null;
+    // Once the user has dragged/wheeled/pinched, a ResizeObserver-driven
+    // refit would fight their camera — stop auto-fitting after that point.
+    let userInteracted = false;
+    let onWheel: (() => void) | null = null;
 
     // Single owner of teardown. `setup()` (post-fetch) and the effect
     // cleanup can both race to destroy the same Pixi Application — whoever
@@ -41,6 +67,7 @@ export default function PixiMap() {
       destroyed = true;
       resizeObserver?.disconnect();
       unsubscribe?.();
+      if (onWheel) host?.removeEventListener("wheel", onWheel);
       renderer?.destroy();
       viewport?.destroy();
       app?.destroy(true, { children: true });
@@ -117,7 +144,16 @@ export default function PixiMap() {
         bottom: bounds.maxY,
         underflow: "center",
       });
-      vp.moveCenter((bounds.minX + bounds.maxX) / 2, (bounds.minY + bounds.maxY) / 2);
+
+      const markUserInteracted = (): void => {
+        userInteracted = true;
+      };
+      vp.on("drag-start", markUserInteracted);
+      vp.on("pinch-start", markUserInteracted);
+      onWheel = markUserInteracted;
+      host!.addEventListener("wheel", onWheel, { passive: true });
+
+      fitToBounds(vp, bounds, width, height);
 
       const r = createRenderer(application, mapJson, {
         onRobotClick: (id) => fleetStore.getState().selectRobot(id),
@@ -142,6 +178,7 @@ export default function PixiMap() {
         const h = Math.max(1, Math.floor(entry.contentRect.height));
         application.renderer.resize(w, h);
         vp.resize(w, h, bounds.width, bounds.height);
+        if (!userInteracted) fitToBounds(vp, bounds, w, h);
       });
       resizeObserver.observe(host!);
     }
