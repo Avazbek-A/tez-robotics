@@ -3,6 +3,7 @@ import type { System } from "./system.js";
 import { ordersRoutes } from "./routes/orders.js";
 import { robotsRoutes } from "./routes/robots.js";
 import { healthRoutes } from "./routes/health.js";
+import { wsRoutes } from "./ws.js";
 
 export interface BuildServerOpts {
   /**
@@ -41,6 +42,7 @@ export async function buildServer(system: System, opts?: BuildServerOpts): Promi
   await app.register(ordersRoutes, { system });
   await app.register(robotsRoutes, { system });
   await app.register(healthRoutes, { system });
+  await app.register(wsRoutes, { system });
 
   return app;
 }
