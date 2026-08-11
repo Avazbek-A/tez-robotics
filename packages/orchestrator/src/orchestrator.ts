@@ -249,6 +249,11 @@ export class Orchestrator {
     return [...this.alarms];
   }
 
+  /** Test/debug hook: reservation-table ownership pass-through, for asserting collision-hole-free recovery around the deadlock backstop. */
+  _reservationOwner(cell: CellKey): RobotId | undefined {
+    return this.reservations.owner(cell);
+  }
+
   // ---- tick pipeline -----------------------------------------------------
 
   private runTick(): void {
@@ -742,34 +747,51 @@ export class Orchestrator {
           const window = leg.nodeIds.slice(leg.progressIndex);
           window.push(nextNode);
           const claimCells = window.map((n) => cellKey(this.map.node(n).pos));
+          // claim() dedupes path revisits internally, so the grant it can
+          // ever return is capped at the number of DISTINCT cells in the
+          // window — compare/index against that deduped list, not the raw
+          // (possibly-revisiting) one, or a revisited window both
+          // mis-detects a full grant as partial and names the wrong denied
+          // cell (finding: minor 6).
+          const dedupedCells = Array.from(new Set(claimCells));
           const granted = this.reservations.claim(id, claimCells);
-          if (granted.length === new Set(claimCells).size) {
+          if (granted.length === dedupedCells.length) {
             leg.nodeIds.push(nextNode);
             leg.blockedTicks = 0;
             changed = true;
           } else {
             leg.blockedTicks++;
-            const deniedCell = claimCells[granted.length] ?? claimCells[0]!;
+            const deniedCell = dedupedCells[granted.length] ?? dedupedCells[0]!;
             this.alarms.push(
               `t=${this.tickCount} contention: robot ${id} blocked at ${deniedCell} ` +
                 `(owner=${String(this.reservations.owner(deniedCell))}, blockedTicks=${leg.blockedTicks})`
             );
             if (leg.blockedTicks >= this.opts.blockedTicksLimit) {
-              this.alarms.push(
-                `t=${this.tickCount} robot ${id} blocked ${leg.blockedTicks} ticks at ${deniedCell} — requeueing order ${leg.orderId}`
-              );
-              void this.adapter.cancelMission(id).catch(() => {
-                /* best-effort */
-              });
-              try {
-                this.book.requeue(leg.orderId, "sustained reservation contention");
-              } catch {
-                /* already terminal */
-              }
-              this.reservations.releaseAll(id);
-              setLeg(rt, undefined);
+              this.requeueBlockedLeg(id, rt, leg, deniedCell);
               continue;
             }
+          }
+        } else {
+          // PIBT offered no forward candidate this tick — either it
+          // returned nothing, or (the canonical case) it resolved to
+          // "stay" because the only cell that makes progress is occupied
+          // by another PIBT-visible agent, e.g. a parked idle robot (see
+          // resolveCurrentNodes()): PIBT's own collision avoidance simply
+          // never proposes stepping onto it, so there is no claim() to
+          // even attempt against a foreign owner. Sustained inability to
+          // advance is sustained inability to advance regardless of which
+          // layer reports it — count it as a blocked tick too, so the
+          // deadlock backstop still fires for the parked-robot-blocks-the
+          // -corridor case, not only for claim() rejections.
+          leg.blockedTicks++;
+          const stuckCell = cellKey(this.map.node(frontierNode).pos);
+          this.alarms.push(
+            `t=${this.tickCount} contention: robot ${id} blocked at ${stuckCell} ` +
+              `(no forward candidate, blockedTicks=${leg.blockedTicks})`
+          );
+          if (leg.blockedTicks >= this.opts.blockedTicksLimit) {
+            this.requeueBlockedLeg(id, rt, leg, stuckCell);
+            continue;
           }
         }
       }
@@ -781,9 +803,61 @@ export class Orchestrator {
           .sendMission({ id: missionId, robotId: id, nodeIds }, this.map)
           .catch((err) => {
             this.alarms.push(`t=${this.tickCount} sendMission failed for ${id}: ${String(err)}`);
+            // Retry next tick: a rejected send is otherwise never retried
+            // once nothing else changes (gated extension means the same
+            // nodeIds may not get appended again for a while), hanging the
+            // order with no backstop — claim()s can keep succeeding even
+            // while the adapter itself keeps rejecting sends. Guard on leg
+            // IDENTITY: rt.leg may have been cleared or replaced (leg
+            // completed, requeued via an unrelated path, deadlock
+            // backstop) while this promise was in flight — only touch the
+            // SAME leg object this send was actually for. A resend after a
+            // genuinely failed send is a brand-new mission from the
+            // adapter's point of view (it recorded nothing), so this can
+            // never trip the adapter's strict-prefix check.
+            if (rt.leg === leg) {
+              leg.sent = false;
+            }
           });
         leg.sent = true;
       }
     }
+  }
+
+  /**
+   * Deadlock backstop recovery: cancel the robot's mission, requeue its
+   * order (OrderBook's 3-retry cap then fails it outright rather than
+   * hanging forever), release all of the robot's reservation holds, and
+   * clear its leg — the same recovery shape as handleMissionFailed().
+   *
+   * Critical fix: release + re-claim must happen together, synchronously,
+   * right here. releaseAll() alone would leave the robot's own
+   * physically-occupied cell unowned for the REMAINDER of this tick's
+   * runRouting() loop (resolveCurrentNodes() — which is what normally
+   * claims an idle robot's current cell — already ran earlier this same
+   * tick), making it claimable by any OTHER robot processed later in this
+   * same loop. Worse, on the VERY NEXT tick, resolveCurrentNodes()'s idle
+   * re-claim for THIS robot would then see the cell as foreign-owned and
+   * get an empty grant (claim() is a no-op on empty grant), so the robot
+   * would never recover ownership of the cell it is still physically
+   * sitting on — a genuine collision hole.
+   */
+  private requeueBlockedLeg(id: RobotId, rt: RobotRuntime, leg: RobotLeg, deniedCell: CellKey): void {
+    this.alarms.push(
+      `t=${this.tickCount} robot ${id} blocked ${leg.blockedTicks} ticks at ${deniedCell} — requeueing order ${leg.orderId}`
+    );
+    void this.adapter.cancelMission(id).catch(() => {
+      /* best-effort */
+    });
+    try {
+      this.book.requeue(leg.orderId, "sustained reservation contention");
+    } catch {
+      /* already terminal */
+    }
+    this.reservations.releaseAll(id);
+    if (rt.currentNodeId !== undefined) {
+      this.reservations.claim(id, [cellKey(this.map.node(rt.currentNodeId).pos)]);
+    }
+    setLeg(rt, undefined);
   }
 }

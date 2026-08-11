@@ -1,8 +1,9 @@
 import { describe, it, expect } from "vitest";
 import { WarehouseMap } from "@tez/core";
 import { FakeAdapter } from "@tez/robot-interface";
-import type { AdapterEvent } from "@tez/robot-interface";
+import type { AdapterEvent, Mission } from "@tez/robot-interface";
 import type { RobotId, RobotState } from "@tez/shared";
+import { cellKey } from "@tez/shared";
 import { Orchestrator } from "../src/orchestrator.js";
 
 /**
@@ -1063,22 +1064,24 @@ describe("Orchestrator", () => {
       // stationary PIBT agent (`at === goal === currentNode`) every tick
       // (see runRouting()), so PIBT's own pre-existing collision avoidance
       // (hardened in Task 1) already refuses to propose the blocked robot
-      // stepping onto that cell — it resolves to "stay". That means this
-      // specific scenario never actually reaches this task's new
-      // reservation-claim/blockedTicks contention path (claim() is never
-      // even attempted, since PIBT offers no candidate move to attempt it
-      // with); the deadlock instead resolves via the pre-existing
-      // premature-missionDone guard, exactly as intended: the short,
-      // already-sent mission (which never got extended toward the blocked
-      // cell) finishes at its own frontier rather than the leg's true
-      // goal, which that guard correctly rejects as premature and
-      // requeues. (The NEW blockedTicks/"contention:" alarm path — for
-      // reservation conflicts invisible to PIBT's single-cell-per-agent
-      // view, e.g. a multi-cell window claimed by another actively-moving
-      // legged robot beyond its current frontier — is exercised by the
-      // other three tests in this suite instead.) Either mechanism is a
-      // correct resolution of the same underlying contention, so accept
-      // both alarm signatures here.
+      // stepping onto that cell — it resolves to "stay". runRouting()'s
+      // "no forward candidate" sub-case (review finding 2) counts that as
+      // a blocked tick too, so blockedTicks can actually accumulate here.
+      //
+      // Tick-driving strategy: pairing adapter.tick() with every
+      // orch.tickOnce() call (as most of this suite does) races the
+      // deadlock backstop against the PRE-EXISTING premature-missionDone
+      // guard — the already-sent (but never further-extended, since it's
+      // blocked) short mission finishes at its own frontier via
+      // FakeAdapter's own tick()-driven progression within about 1 tick of
+      // becoming blocked, well before blockedTicks can climb anywhere near
+      // the limit, so pairing every tick would pin the WRONG mechanism.
+      // Instead: pair ticks only while the order is NOT "underway" (the
+      // pick leg and any post-requeue re-pick genuinely need physical
+      // movement to complete), and drive orchestrator-only ticks (no
+      // adapter.tick()) once "underway" — so the robot never physically
+      // catches up to finish its stale short mission early, and
+      // blockedTicks is free to climb to the limit via the backstop.
       const map = WarehouseMap.fromJSON(WarehouseMap.grid(3, 1));
       const adapter = new FakeAdapter(
         [
@@ -1087,25 +1090,166 @@ describe("Orchestrator", () => {
         ],
         map
       );
-      const orch = new Orchestrator(map, adapter, { horizon: 3, blockedTicksLimit: 5 });
+      const orch = new Orchestrator(map, adapter, { horizon: 3, blockedTicksLimit: 3 });
       adapter.tick();
       orch.tickOnce();
       const order = orch.submitOrder("n2_0", "n0_0");
-      for (let i = 0; i < 60; i++) {
-        adapter.tick();
-        orch.tickOnce();
+      let terminal = false;
+      for (let i = 0; i < 200 && !terminal; i++) {
+        const status = orch.snapshot().orders.find((o) => o.id === order.id)?.status;
+        if (status === "underway") {
+          orch.tickOnce();
+        } else {
+          adapter.tick();
+          orch.tickOnce();
+        }
+        terminal = orch.snapshot().orders.find((o) => o.id === order.id)?.status === "failed";
       }
       const snap = orch.snapshot();
       const o = snap.orders.find((x) => x.id === order.id)!;
       expect(o.status).toBe("failed");
       expect(o.retries).toBe(3);
-      expect(
-        orch
-          .getAlarms()
-          .some(
-            (a) => a.includes("contention") || a.includes("blocked") || a.includes("premature missionDone")
-          )
-      ).toBe(true);
+      // Pins the backstop mechanism specifically (not the pre-existing
+      // premature-missionDone guard, which this tick strategy avoids
+      // racing): exactly 3 backstop firings, one per retry, and zero
+      // premature-missionDone cancellations.
+      const backstopAlarms = orch.getAlarms().filter((a) => a.includes("— requeueing order"));
+      expect(backstopAlarms).toHaveLength(3);
+      expect(orch.getAlarms().some((a) => a.includes("premature missionDone"))).toBe(false);
+    });
+
+    it("deadlock backstop re-claims the blocked robot's own cell (no collision hole)", () => {
+      // Direct regression test for review finding 1 (Critical): releaseAll()
+      // alone would leave the robot's own physically-occupied cell unowned
+      // for the rest of this tick's runRouting() loop and, on the NEXT
+      // tick, resolveCurrentNodes()'s idle re-claim would see it as
+      // (wrongly) foreign-owned and never recover it. Verifies the fix two
+      // ways: (a) directly, via the _reservationOwner() test hook, that the
+      // robot's TRUE physical cell is owned by itself immediately after the
+      // backstop fires; (b) behaviorally, that no other robot's sent
+      // mission ever contains that cell afterward.
+      const map = WarehouseMap.fromJSON(WarehouseMap.grid(3, 1));
+      const adapter = new FakeAdapter(
+        [
+          { id: "r1" as RobotId, startNodeId: "n0_0" },
+          { id: "r2" as RobotId, startNodeId: "n1_0" },
+        ],
+        map
+      );
+      const sent = spyMissions(adapter);
+      const orch = new Orchestrator(map, adapter, { horizon: 3, blockedTicksLimit: 3 });
+      adapter.tick();
+      orch.tickOnce();
+      const order = orch.submitOrder("n2_0", "n0_0");
+
+      let underway = false;
+      for (let i = 0; i < 20 && !underway; i++) {
+        adapter.tick();
+        orch.tickOnce();
+        underway = orch.snapshot().orders.find((o) => o.id === order.id)?.status === "underway";
+      }
+      expect(underway).toBe(true);
+
+      let backstopFired = false;
+      for (let i = 0; i < 20 && !backstopFired; i++) {
+        orch.tickOnce(); // orchestrator-only: see tick-strategy note above
+        backstopFired = orch.getAlarms().some((a) => a.includes("— requeueing order"));
+      }
+      expect(backstopFired).toBe(true);
+      expect(orch.snapshot().orders.find((o) => o.id === order.id)?.status).toBe("queued");
+
+      // (a) r2's TRUE physical position (not its stuck frontier — the
+      // committed-but-untraversed cells ahead of it are correctly released,
+      // only the cell it is actually SITTING on must be re-claimed) is
+      // owned by r2 itself, immediately, same tick.
+      const r2Pos = orch.snapshot().robots.find((r) => r.id === "r2")?.pos;
+      expect(r2Pos).toBeDefined();
+      const r2Cell = cellKey(r2Pos!);
+      expect(orch._reservationOwner(r2Cell)).toBe("r2");
+
+      // (b) drive the rest of the scenario (further requeue/redispatch
+      // cycles) and confirm no OTHER robot's sent mission ever routes
+      // through r2's cell — the only other robot here (r1) never gets a
+      // leg at all in this scenario, so this also confirms r1 stays
+      // correctly excluded from ever being routed through it.
+      for (let i = 0; i < 60; i++) {
+        const status = orch.snapshot().orders.find((o) => o.id === order.id)?.status;
+        if (status === "underway") orch.tickOnce();
+        else {
+          adapter.tick();
+          orch.tickOnce();
+        }
+      }
+      for (const m of sent) {
+        if (m.robotId === "r2") continue;
+        for (const n of m.nodeIds) {
+          expect(
+            cellKey(map.node(n).pos),
+            `${m.robotId} ${m.id} routed through r2's cell ${r2Cell}`
+          ).not.toBe(r2Cell);
+        }
+      }
+    });
+
+    it("a rejected sendMission is retried the next tick instead of hanging", async () => {
+      // Direct regression test for review finding 4 (Important): with
+      // gated extension, leg.sent was set unconditionally, so a
+      // transiently-rejected send was never retried once nothing else
+      // changed — no further extension needed (frontier already at goal),
+      // so `changed` stays false forever and the order would hang with no
+      // backstop (reservation claims keep succeeding; it's the adapter
+      // send itself that's failing).
+      //
+      // Pickup is r1's OWN starting cell so the pick leg's frontier already
+      // equals its goal the instant it's created — no extension is ever
+      // attempted, isolating the retry-on-failed-send path as the ONLY
+      // possible cause of a second send (a legitimate extension-driven
+      // resend would otherwise mask whether this fix is doing anything).
+      class FlakySendAdapter extends FakeAdapter {
+        private failuresLeft: number;
+        constructor(
+          robots: Array<{ id: RobotId; startNodeId: string }>,
+          map: WarehouseMap,
+          failuresLeft: number
+        ) {
+          super(robots, map);
+          this.failuresLeft = failuresLeft;
+        }
+        override async sendMission(m: Mission, mp: WarehouseMap): Promise<void> {
+          if (this.failuresLeft > 0) {
+            this.failuresLeft--;
+            throw new Error("simulated transient send failure");
+          }
+          return super.sendMission(m, mp);
+        }
+      }
+
+      const map = grid(4);
+      const adapter = new FlakySendAdapter([{ id: "r1", startNodeId: "n0_0" }], map, 1);
+      const sent = spyMissions(adapter);
+      const orch = new Orchestrator(map, adapter, {});
+      adapter.tick();
+      orch.tickOnce();
+      const order = orch.submitOrder("n0_0", "n3_3");
+
+      orch.tickOnce(); // dispatch + first (failing) send attempt
+      expect(sent.length).toBe(1);
+
+      // Let the rejected promise's .catch() microtask run.
+      await new Promise((r) => setTimeout(r, 0));
+      expect(orch.getAlarms().some((a) => a.includes("sendMission failed"))).toBe(true);
+
+      orch.tickOnce(); // must retry: nothing else would trigger a resend here
+      expect(sent.length).toBe(2);
+      expect(sent[0]!.nodeIds).toEqual(sent[1]!.nodeIds);
+
+      let completed = false;
+      for (let i = 0; i < 60 && !completed; i++) {
+        adapter.tick();
+        orch.tickOnce();
+        completed = orch.snapshot().orders.find((o) => o.id === order.id)?.status === "completed";
+      }
+      expect(completed).toBe(true);
     });
   });
 });
