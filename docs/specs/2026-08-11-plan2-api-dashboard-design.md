@@ -148,8 +148,22 @@ no new package.
 | react, vite | MIT |
 | tailwindcss, shadcn/ui (vendored source) | MIT |
 | recharts | MIT |
+| @fontsource/ibm-plex-sans, @fontsource/jetbrains-mono (font files) | SIL OFL-1.1 |
 
 No AGPL/GPL anywhere (Grafana embed and bekirbostanci tools stay out).
+
+**Owner-approved gate exception (2026-08-11):** the stated license gate
+("MIT / Apache-2.0 / BSD / EPL / ISC only") is a code-package gate; it does
+not fit font files, which the type foundry world licenses almost
+exclusively under SIL OFL-1.1 (not one of the listed code licenses).
+`@fontsource/ibm-plex-sans` and `@fontsource/jetbrains-mono` ship IBM Plex
+Sans and JetBrains Mono, both OFL-1.1-licensed font assets bundled as npm
+packages purely for their static font files (no executable license terms
+beyond OFL's font-specific reciprocity, which doesn't propagate to
+surrounding application code). The owner approved OFL-1.1 as allowed for
+font files on this basis. All code packages (everything else in this table)
+remain MIT/Apache-2.0/BSD/EPL/ISC as originally gated — this exception is
+scoped to font assets only.
 
 ## Out of scope
 
