@@ -78,6 +78,20 @@ describe("repos", () => {
     expect(hist[1].robot_id).toBe("r1");
   });
 
+  it("breaks ties on equal `at` timestamps by insertion order (id asc)", async () => {
+    const sameAt = "2026-08-11T00:03:00.000Z";
+    await repos.orders.appendHistory("ord-00002", sameAt, "dispatched", "r2", "first");
+    await repos.orders.appendHistory("ord-00002", sameAt, "underway", "r2", "second");
+
+    const hist = await repos.orders.history("ord-00002");
+    expect(hist).toHaveLength(2);
+    expect(hist[0].status).toBe("dispatched");
+    expect(hist[0].note).toBe("first");
+    expect(hist[1].status).toBe("underway");
+    expect(hist[1].note).toBe("second");
+    expect(Number(hist[0].id)).toBeLessThan(Number(hist[1].id));
+  });
+
   it("upserts a robot and lists it", async () => {
     const robot: RobotState = {
       id: "r1",

@@ -60,6 +60,8 @@ export function createRepos(driver: SqlDriver): Repos {
           params.push(opts.status);
           sql += ` where status = $${params.length}`;
         }
+        // Default newest-first: callers list orders for dashboards/audits where
+        // recent activity is the primary interest.
         sql += " order by created_at desc";
         if (opts?.limit !== undefined) {
           params.push(opts.limit);
@@ -71,7 +73,11 @@ export function createRepos(driver: SqlDriver): Repos {
 
       async history(orderId: string): Promise<Array<Record<string, unknown>>> {
         const r = await driver.query(
-          "select * from transport_order_history where order_id = $1 order by at asc",
+          // `id asc` tiebreaker: rows with equal `at` timestamps (e.g. two
+          // transitions recorded in the same millisecond) still need a
+          // deterministic order; insertion order (bigserial id) is the
+          // natural tiebreak.
+          "select * from transport_order_history where order_id = $1 order by at asc, id asc",
           [orderId]
         );
         return r.rows;
@@ -83,7 +89,9 @@ export function createRepos(driver: SqlDriver): Repos {
         // JSONB param note (verified against pglite): pglite's parameterized
         // query() accepts a plain JS object directly for a jsonb column — no
         // JSON.stringify(...) needed. Passing the whole RobotState as
-        // last_state here.
+        // last_state here — this duplicates r.id into the jsonb blob (also
+        // stored in the `id` column), left as-is: harmless and cheaper than
+        // reshaping the object just to omit one field.
         await driver.query(
           `insert into robots (id, last_state, updated_at)
            values ($1, $2, now())
@@ -95,7 +103,10 @@ export function createRepos(driver: SqlDriver): Repos {
       },
 
       async list(): Promise<Array<Record<string, unknown>>> {
-        const r = await driver.query("select * from robots order by id");
+        // Always pass an explicit params array (even empty) — params === undefined
+        // routes to the exec() multi-statement path instead of the single-statement
+        // extended-protocol path every other query here uses.
+        const r = await driver.query("select * from robots order by id", []);
         return r.rows;
       },
     },
@@ -118,7 +129,8 @@ export function createRepos(driver: SqlDriver): Repos {
 
       async kpiRange(fromIso: string, toIso: string): Promise<Array<Record<string, unknown>>> {
         const r = await driver.query(
-          "select * from kpi_snapshots where at >= $1 and at <= $2 order by at asc",
+          // `id asc` tiebreaker for deterministic ordering on equal `at` timestamps.
+          "select * from kpi_snapshots where at >= $1 and at <= $2 order by at asc, id asc",
           [fromIso, toIso]
         );
         return r.rows;
