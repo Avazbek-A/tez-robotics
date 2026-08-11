@@ -13,6 +13,7 @@
   "scripts": {
     "test": "vitest run --run",
     "demo": "node scripts/demo.mjs",
-    "demo:vda": "node scripts/demo.mjs --vda"
+    "demo:vda": "node scripts/demo.mjs --vda",
+    "demo:film": "node scripts/demo.mjs --film"
   }
 }

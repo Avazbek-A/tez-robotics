@@ -16,10 +16,23 @@ import path from "node:path";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const VDA = process.argv.includes("--vda");
+const FILM = process.argv.includes("--film");
 const API_PORT = 8080;
 const DASHBOARD_PORT = 5173;
 const ORDER_COUNT = 6;
 const ORDER_STAGGER_MS = 4000;
+
+// --film: the President-Tech-Award recording configuration. Bigger floor
+// (20x10 vs the default 8x8), a full 8-robot fleet (the demo-mode maximum,
+// see DEMO_START_NODES in packages/api/src/demo-map.ts), and a continuous
+// order generator that keeps the active queue topped up so the fleet never
+// goes idle on camera. FakeAdapter lockstep only (--film + --vda is
+// rejected): lockstep is the collision-clean path until BACKLOG P0 lands.
+const FILM_GRID = { width: 20, height: 10 };
+const FILM_ROBOTS = 8;
+const FILM_TARGET_ACTIVE = 6; // keep this many orders in flight
+const FILM_ORDER_INTERVAL_MS = 2500;
+const FILM_MIN_MANHATTAN = 6; // short hops read as jitter on camera
 
 // ---------------------------------------------------------------------------
 // KNOWN ISSUE this script works around: `node packages/api/dist/main.js`
@@ -113,6 +126,78 @@ const CURATED_PAIRS = [
   ["n4_1", "n1_4"],
   ["n6_2", "n2_6"],
 ];
+
+// Mirrors WarehouseMap.grid(width, height) (packages/core/src/map.ts) —
+// same node ids `n{x}_{y}` (0-indexed), same 4-neighbor bidirectional
+// edges, chargers along the x=0 column. Duplicated here for the same
+// reason as CURATED_PAIRS: plain-JS root script, no import path into the
+// TS packages.
+function gridMapJson(width, height) {
+  const nodes = [];
+  const edges = [];
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      nodes.push({ id: `n${x}_${y}`, pos: { x, y }, ...(x === 0 ? { charger: true } : {}) });
+    }
+  }
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const id = `n${x}_${y}`;
+      if (x + 1 < width) edges.push({ from: id, to: `n${x + 1}_${y}`, bidirectional: true });
+      if (y + 1 < height) edges.push({ from: id, to: `n${x}_${y + 1}`, bidirectional: true });
+    }
+  }
+  return { nodes, edges };
+}
+
+// Continuous order stream for --film: tops the active queue back up to
+// FILM_TARGET_ACTIVE whenever completions drain it. Random pickup/drop
+// pairs, charger column (x=0) excluded, minimum manhattan distance so
+// every trip is a visible traversal. Runs until Ctrl-C.
+async function filmOrderLoop(port, { width, height }) {
+  const randNode = () => {
+    const x = 1 + Math.floor(Math.random() * (width - 1));
+    const y = Math.floor(Math.random() * height);
+    return { x, y, id: `n${x}_${y}` };
+  };
+  console.log(
+    `[film] continuous order stream: keeping ~${FILM_TARGET_ACTIVE} orders active, new order every ${FILM_ORDER_INTERVAL_MS / 1000}s when below target`,
+  );
+  while (!shuttingDown) {
+    try {
+      const res = await fetch(`http://localhost:${port}/orders`);
+      if (res.ok) {
+        const { orders } = await res.json();
+        const active = orders.filter((o) => ["queued", "dispatched", "underway"].includes(o.status)).length;
+        if (active < FILM_TARGET_ACTIVE) {
+          let a = randNode();
+          let b = randNode();
+          for (
+            let tries = 0;
+            (a.id === b.id || Math.abs(a.x - b.x) + Math.abs(a.y - b.y) < FILM_MIN_MANHATTAN) && tries < 20;
+            tries++
+          ) {
+            b = randNode();
+          }
+          const post = await fetch(`http://localhost:${port}/orders`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ pickupNode: a.id, dropNode: b.id }),
+          });
+          if (post.ok) {
+            const order = await post.json();
+            console.log(`[film] order ${order.id}: ${a.id} -> ${b.id} (${active + 1}/${FILM_TARGET_ACTIVE} active)`);
+          } else {
+            console.warn(`[film] order POST failed: HTTP ${post.status} ${await post.text()}`);
+          }
+        }
+      }
+    } catch (err) {
+      if (!shuttingDown) console.warn("[film] order loop error:", err instanceof Error ? err.message : err);
+    }
+    await delay(FILM_ORDER_INTERVAL_MS);
+  }
+}
 
 const children = [];
 function track(child) {
@@ -208,6 +293,10 @@ async function seedOrders(port, { count = ORDER_COUNT, staggerMs = ORDER_STAGGER
 }
 
 async function main() {
+  if (FILM && VDA) {
+    throw new Error("--film and --vda are mutually exclusive: filming uses FakeAdapter lockstep (see BACKLOG P0)");
+  }
+
   console.log(`[demo] building @tez/api...`);
   await run("corepack", ["pnpm", "--filter", "@tez/api", "exec", "tsc", "-p", "tsconfig.build.json"]);
 
@@ -218,6 +307,14 @@ async function main() {
   } else {
     apiEnv.DEMO = "1";
     apiEnv.PGLITE_DIR = apiEnv.PGLITE_DIR ?? "memory";
+  }
+  if (FILM) {
+    const dir = await mkdtemp(path.join(tmpdir(), "tez-film-map-"));
+    const mapPath = path.join(dir, "film-20x10.json");
+    await writeFile(mapPath, JSON.stringify(gridMapJson(FILM_GRID.width, FILM_GRID.height)));
+    apiEnv.MAP_FILE = mapPath;
+    apiEnv.ROBOTS = String(FILM_ROBOTS);
+    console.log(`[film] ${FILM_GRID.width}x${FILM_GRID.height} floor, ${FILM_ROBOTS} robots (map: ${mapPath})`);
   }
 
   console.log(`[demo] starting api (${VDA ? "vda + dev broker" : "demo/FakeAdapter"}) on :${API_PORT}...`);
@@ -331,7 +428,9 @@ async function main() {
   // order's WS frame racing the dashboard's own boot in the terminal log.
   await delay(1500);
 
-  if (!VDA) {
+  if (FILM) {
+    filmOrderLoop(API_PORT, FILM_GRID).catch((err) => console.error("[film] order loop failed:", err));
+  } else if (!VDA) {
     console.log(`[demo] seeding ${ORDER_COUNT} demo orders (${ORDER_STAGGER_MS / 1000}s stagger)...`);
     seedOrders(API_PORT).catch((err) => console.error("[demo] seeding failed:", err));
   }

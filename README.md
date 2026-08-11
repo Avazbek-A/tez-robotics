@@ -44,6 +44,9 @@ One command boots the real orchestrator behind a Fastify API, streaming live fle
 ```bash
 corepack pnpm install
 corepack pnpm demo
+
+# filming configuration: 20x10 floor, 8 robots, continuous order stream
+corepack pnpm demo:film
 ```
 
 This builds `@tez/api`, starts it in `DEMO` mode (an in-memory `FakeAdapter` fleet — no MQTT broker or physical robots needed), starts the dashboard's Vite dev server, and seeds a handful of demo orders on a stagger:
