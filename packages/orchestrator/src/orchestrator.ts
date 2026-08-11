@@ -262,6 +262,28 @@ export class Orchestrator {
     // unhandled error that can crash the process. Log and skip the rest of
     // this tick rather than taking the whole fleet down; the next tick
     // gets a fresh chance.
+    //
+    // Ordering invariant — own-cell reservation ownership after
+    // releaseAll()/setLeg(undefined): resolveCurrentNodes() (step 2,
+    // below) is what normally re-establishes an idle robot's ownership of
+    // the cell it's physically sitting on (see its own "idle robots own
+    // their cell" claim). Any path that calls
+    // `this.reservations.releaseAll(id)` + `setLeg(rt, undefined)` DURING
+    // event draining (step 1 — e.g. handleMissionDone's premature-guard,
+    // handleMissionFailed, verifyReportingRobot's stale-report cleanup)
+    // can safely rely on resolveCurrentNodes() running immediately
+    // afterward, same tick, to re-claim that cell before runDispatch/
+    // runRouting (steps 4-5) ever run. Any release path that instead runs
+    // AFTER resolveCurrentNodes() — currently handleOfflineTimeouts()
+    // (step 3) and requeueBlockedLeg() (called from within runRouting(),
+    // step 5) — has NO such safety net for the remainder of THIS tick, and
+    // MUST re-claim the robot's own current cell itself, synchronously,
+    // right after its own releaseAll() call, or the cell is left unowned
+    // (claimable by another robot processed later this tick, and
+    // unrecoverable by this robot's own idle re-claim next tick, since
+    // claim() is a no-op on an empty/foreign-owned grant) — see
+    // requeueBlockedLeg() and handleOfflineTimeouts() for the concrete
+    // fix shape.
     try {
       this.tickCount++;
       const events = this.eventQueue.splice(0, this.eventQueue.length);
@@ -670,7 +692,22 @@ export class Orchestrator {
       if (!rt.leg) {
         // Idle robots always own the cell they are parked on, so no other
         // robot's committed window can ever be granted through them.
-        this.reservations.claim(id, [cellKey(this.map.node(nodeId).pos)]);
+        const idleCell = cellKey(this.map.node(nodeId).pos);
+        const granted = this.reservations.claim(id, [idleCell]);
+        if (granted.length === 0) {
+          // Should be unreachable in a correctly-functioning fleet — the
+          // only way another robot could already foreign-own the cell
+          // THIS robot is physically standing on is a prior collision-hole
+          // bug (see runTick()'s ordering-invariant note and
+          // requeueBlockedLeg()/handleOfflineTimeouts()'s own-cell
+          // re-claims). Alarmed here, not silently swallowed, so the "idle
+          // robots own their cell" invariant is directly observable if it
+          // is ever violated again.
+          this.alarms.push(
+            `t=${this.tickCount} robot ${id} idle self-claim of ${idleCell} DENIED ` +
+              `(owner=${String(this.reservations.owner(idleCell))}) — collision-hole invariant violated`
+          );
+        }
       }
       if (rt.leg && rt.leg.nodeIds.length === 0) {
         rt.leg.nodeIds = [nodeId];
@@ -700,6 +737,25 @@ export class Orchestrator {
         }
       }
       this.reservations.releaseAll(id);
+      // Re-claim the robot's own physically-occupied cell immediately —
+      // same collision-hole fix as requeueBlockedLeg(), and needed here
+      // for the same reason: this runs at pipeline step 3
+      // (handleOfflineTimeouts), AFTER resolveCurrentNodes() (step 2)
+      // already ran this tick, so nothing else re-establishes ownership
+      // before runRouting() (step 5) runs later THIS SAME tick. Without
+      // this, the offline robot's cell is unowned for the rest of this
+      // tick's runRouting() — another robot's committed window can get a
+      // FULL grant through it (PIBT still pushes the frozen robot
+      // virtually, so it doesn't stop that OTHER robot's proposed move
+      // either) — and on the VERY NEXT tick, resolveCurrentNodes()'s own
+      // idle re-claim for this robot would then see the cell as
+      // foreign-owned and never recover it: a permanent collision hole
+      // where a traveling robot's commanded path drives straight through
+      // where the frozen, offline robot physically still sits. See the
+      // ordering invariant noted on runTick().
+      if (rt.currentNodeId !== undefined) {
+        this.reservations.claim(id, [cellKey(this.map.node(rt.currentNodeId).pos)]);
+      }
       setLeg(rt, undefined);
       void this.adapter.cancelMission(id).catch(() => {
         /* best-effort; robot is unreachable anyway */

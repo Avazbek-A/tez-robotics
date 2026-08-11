@@ -1351,6 +1351,94 @@ describe("Orchestrator", () => {
       }
     });
 
+    it("offline-timeout re-claims the frozen robot's own cell (no collision hole)", () => {
+      // Direct regression test for the final whole-branch review's finding
+      // 1 (Important): handleOfflineTimeouts() was the last remaining
+      // releaseAll() path with no own-cell re-claim, AND it runs at
+      // pipeline step 3 — AFTER resolveCurrentNodes() (step 2) already ran
+      // this tick — so nothing heals it before runDispatch/runRouting
+      // (steps 4-5) run later this SAME tick, unlike releaseAll() calls
+      // during event draining (step 1), which resolveCurrentNodes()
+      // immediately re-claims for. Cloned from the deadlock-backstop
+      // collision-hole test's shape (requeueBlockedLeg's own regression
+      // test above): (a) directly, via _reservationOwner(), that the
+      // offline robot's TRUE physical cell is owned by itself immediately
+      // after the offline timeout fires, same tick; (b) behaviorally, that
+      // no OTHER robot's sent mission ever contains that cell afterward.
+      const map = WarehouseMap.fromJSON(WarehouseMap.grid(3, 1));
+      const adapter = new FakeAdapter(
+        [
+          { id: "r1" as RobotId, startNodeId: "n0_0" },
+          { id: "r2" as RobotId, startNodeId: "n2_0" },
+        ],
+        map
+      );
+      const sent = spyMissions(adapter);
+      const clock = fakeClock();
+      const orch = new Orchestrator(map, adapter, { now: clock.now, offlineGraceMs: 5_000 });
+      adapter.tick();
+      orch.tickOnce();
+
+      // r1 gets a short hop toward the corridor middle so it has somewhere
+      // to physically freeze other than its own start cell.
+      const order = orch.submitOrder("n1_0", "n0_0");
+      let underway = false;
+      for (let i = 0; i < 10 && !underway; i++) {
+        adapter.tick();
+        orch.tickOnce();
+        underway = orch.snapshot().orders.find((o) => o.id === order.id)?.status === "underway";
+      }
+      expect(underway).toBe(true);
+      expect(orch.snapshot().orders.find((o) => o.id === order.id)?.robotId).toBe("r1");
+
+      // Drop the connection and let the grace period expire — same
+      // injectable-clock technique the other offline tests in this file
+      // use.
+      adapter.setConnection("r1" as RobotId, false);
+      orch.tickOnce();
+      clock.advance(6_000);
+      orch.tickOnce(); // handleOfflineTimeouts fires THIS tick
+
+      expect(
+        orch.getAlarms().some((a) => a.includes("robot r1 offline") && a.includes("requeued"))
+      ).toBe(true);
+
+      // (a) r1's TRUE physical position is owned by itself, immediately,
+      // same tick — not left unowned for runDispatch/runRouting (which
+      // already ran, or are about to run, later in this very tick) to
+      // grant away to r2.
+      const r1Pos = orch.snapshot().robots.find((r) => r.id === "r1")?.pos;
+      expect(r1Pos).toBeDefined();
+      const r1Cell = cellKey(r1Pos!);
+      expect(orch._reservationOwner(r1Cell)).toBe("r1");
+      // The empty-grant alarm added for finding 4 must NOT fire here —
+      // this test's whole point is that the fix prevents the violation it
+      // would otherwise detect.
+      expect(orch.getAlarms().some((a) => a.includes("collision-hole invariant violated"))).toBe(false);
+
+      // (b) drive the rest of the scenario (order gets requeued and
+      // re-dispatched to r2, which must route around r1's frozen corridor
+      // cell) and confirm no OTHER robot's sent mission ever contains it.
+      for (let i = 0; i < 60; i++) {
+        const status = orch.snapshot().orders.find((o) => o.id === order.id)?.status;
+        if (status === "underway") orch.tickOnce();
+        else {
+          adapter.tick();
+          orch.tickOnce();
+        }
+      }
+      for (const m of sent) {
+        if (m.robotId === "r1") continue;
+        for (const n of m.nodeIds) {
+          expect(
+            cellKey(map.node(n).pos),
+            `${m.robotId} ${m.id} routed through r1's frozen cell ${r1Cell}`
+          ).not.toBe(r1Cell);
+        }
+      }
+      expect(orch.getAlarms().some((a) => a.includes("collision-hole invariant violated"))).toBe(false);
+    });
+
     it("a rejected sendMission is retried the next tick instead of hanging", async () => {
       // Direct regression test for review finding 4 (Important): with
       // gated extension, leg.sent was set unconditionally, so a
