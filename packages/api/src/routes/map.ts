@@ -1,5 +1,5 @@
 import type { FastifyInstance, FastifyPluginOptions } from "fastify";
-import { writeFileSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
 import { Type } from "@sinclair/typebox";
 import { WarehouseMap } from "@tez/core";
 import type { System } from "../system.js";
@@ -35,6 +35,11 @@ const PutMapResponse = Type.Object({
  * already-running orchestrator would require rebuilding its routing state
  * mid-flight — out of v1 scope — so the response honestly flags
  * restartRequired instead of pretending the swap is live.
+ *
+ * The write uses fs/promises so it doesn't block the event loop that's
+ * also driving demo mode's lockstep setInterval (fake.tick() +
+ * orchestrator.tickOnce()) — a synchronous writeFileSync here would stall
+ * every robot's tick for the duration of the disk write.
  */
 export async function mapRoutes(app: FastifyInstance, opts: MapRouteOpts): Promise<void> {
   const { system, mapFile } = opts;
@@ -59,6 +64,7 @@ export async function mapRoutes(app: FastifyInstance, opts: MapRouteOpts): Promi
         response: {
           200: PutMapResponse,
           400: ErrorResponse,
+          500: ErrorResponse,
         },
       },
     },
@@ -70,7 +76,12 @@ export async function mapRoutes(app: FastifyInstance, opts: MapRouteOpts): Promi
         return { error: err instanceof Error ? err.message : String(err) };
       }
 
-      writeFileSync(targetFile, JSON.stringify(request.body, null, 2));
+      try {
+        await writeFile(targetFile, JSON.stringify(request.body, null, 2));
+      } catch (err) {
+        reply.code(500);
+        return { error: err instanceof Error ? err.message : String(err) };
+      }
       return { ok: true as const, restartRequired: true as const };
     }
   );

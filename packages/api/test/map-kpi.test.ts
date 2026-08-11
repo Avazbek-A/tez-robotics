@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WarehouseMap } from "@tez/core";
@@ -12,10 +12,11 @@ let app: FastifyInstance;
 let stop: () => Promise<void>;
 let mapFile: string;
 let bootMapJson: unknown;
+let tmpDir: string;
 
 beforeAll(async () => {
-  const dir = mkdtempSync(join(tmpdir(), "tez-api-map-"));
-  mapFile = join(dir, "map.json");
+  tmpDir = mkdtempSync(join(tmpdir(), "tez-api-map-"));
+  mapFile = join(tmpDir, "map.json");
   bootMapJson = WarehouseMap.grid(4, 4);
   writeFileSync(mapFile, JSON.stringify(bootMapJson));
 
@@ -34,6 +35,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await app.close();
   await stop();
+  rmSync(tmpDir, { recursive: true, force: true });
 });
 
 describe("map + kpi", () => {
@@ -79,5 +81,42 @@ describe("map + kpi", () => {
     expect(res.statusCode).toBe(200);
     const body = res.json();
     expect(body.openapi).toMatch(/^3\./);
+  });
+});
+
+describe("PUT /map write failure", () => {
+  it("responds 500 {error} when the write target's directory doesn't exist", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tez-api-map-fail-"));
+    const bootFile = join(dir, "boot.json");
+    writeFileSync(bootFile, JSON.stringify(WarehouseMap.grid(2, 2)));
+    // Parent directory intentionally absent so fs/promises.writeFile fails
+    // with ENOENT — exercises the route's write-failure catch branch.
+    const unwritableTarget = join(dir, "no-such-subdir", "map.json");
+
+    const config = loadConfig({
+      DEMO: "1",
+      TICK_MS: "10",
+      ROBOTS: "1",
+      MAP_FILE: bootFile,
+    });
+    const sys = await buildSystem(config);
+    await sys.start();
+    const failApp = await buildServer(sys, { config: { ...config, mapFile: unwritableTarget } });
+
+    try {
+      const res = await failApp.inject({
+        method: "PUT",
+        url: "/map",
+        payload: WarehouseMap.grid(2, 2),
+      });
+      expect(res.statusCode).toBe(500);
+      const body = res.json();
+      expect(typeof body.error).toBe("string");
+      expect(Object.keys(body)).toEqual(["error"]);
+    } finally {
+      await failApp.close();
+      await sys.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
