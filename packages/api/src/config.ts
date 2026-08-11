@@ -17,10 +17,10 @@ function intEnv(
 ): number {
   const value = env[name];
   if (value === undefined) return fallback;
-  const parsed = parseInt(value, 10);
-  if (isNaN(parsed)) {
+  if (!/^-?\d+$/.test(value.trim())) {
     throw new Error(`${name} must be an integer`);
   }
+  const parsed = parseInt(value, 10);
   return parsed;
 }
 
@@ -28,8 +28,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): ApiConfig {
   const mode = env.DEMO === "1" ? "demo" : "vda";
   const devBroker = env.DEV_BROKER === "1";
 
-  // In vda mode with explicit DEMO=0, MQTT_URL is required unless DEV_BROKER is enabled
-  if (mode === "vda" && env.DEMO === "0" && !devBroker && !env.MQTT_URL) {
+  // In vda mode, MQTT_URL is required unless DEV_BROKER is enabled
+  if (mode === "vda" && !devBroker && !env.MQTT_URL) {
     throw new Error("MQTT_URL is required in vda mode without DEV_BROKER");
   }
 
