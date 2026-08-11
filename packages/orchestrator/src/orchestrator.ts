@@ -9,15 +9,19 @@ export interface OrchestratorOpts {
   /** Timer interval for start()'s auto-tick loop. Default 500ms. */
   tickMs?: number;
   /**
-   * Nominal look-ahead horizon in cells. v1 simplification: only the
-   * immediate next cell is genuinely committed per tick (see design notes
-   * in task-10-report.md) — this option is accepted for forward
-   * compatibility but not yet used to precompute a deeper reservation
-   * horizon.
+   * Max committed-but-untraversed nodes ahead of the robot; extension
+   * pauses at this depth until the robot catches up. Default 5.
    */
   horizon?: number;
   /** Grace period before an offline robot's order is requeued. Default 10000ms. */
   offlineGraceMs?: number;
+  /**
+   * Deadlock backstop: consecutive fully-blocked routing ticks (robot
+   * caught up to its frontier but the reservation claim for the next cell
+   * keeps failing) after which the leg's order is requeued. Default 20
+   * (= 10s at the default 500ms tick).
+   */
+  blockedTicksLimit?: number;
   /** Injectable clock (ms epoch), for deterministic tests. Default Date.now. */
   now?: () => number;
 }
@@ -29,6 +33,10 @@ interface RobotLeg {
   missionId: string;
   nodeIds: string[];
   sent: boolean;
+  /** Index into nodeIds of the robot's confirmed position on this path (monotonic). */
+  progressIndex: number;
+  /** Consecutive routing ticks the leg was extension-blocked by a failed claim. */
+  blockedTicks: number;
 }
 
 interface RobotRuntime {
@@ -100,27 +108,34 @@ function setLeg(rt: RobotRuntime, leg: RobotLeg | undefined): void {
  *
  * Pipeline per tick, see task-10-report.md for full design rationale:
  *   1. drain queued adapter events (robot registry, order lifecycle)
- *   2. resolve each robot's current map node; quarantine unresolvable ones
+ *   2. resolve each robot's current map node; quarantine unresolvable ones;
+ *      idle robots (no leg) claim their own parked cell
  *   3. requeue orders for robots offline beyond the grace period
  *   4. dispatch idle robots x queued orders (Hungarian)
- *   5. PIBT step for all routable robots; extend/send missions for active
- *      legs; reservation claim as a contention-detecting safety net
+ *   5. PIBT step over each legged robot's committed FRONTIER (not its true
+ *      position) and each idle robot's true position; extend a leg's path
+ *      only when it is within `opts.horizon` nodes of its frontier, and
+ *      only ever commit an extension on a FULL reservation grant for the
+ *      whole uncommitted window — the ReservationTable is the source of
+ *      truth for committed cells, never advisory
  *
- * IMPORTANT — v1 lockstep precondition (see task-10-report.md §5): the
- * "no two robots ever share a cell" guarantee comes entirely from PIBT's
- * `step()` being called once per tick over the FULL set of currently
- * routable robots' TRUE current positions. That only holds when robot
- * position updates and orchestrator ticks are interleaved in lockstep —
- * exactly what the FakeAdapter-driven tests do (`adapter.tick()` then
- * `orchestrator.tickOnce()`, one full step at a time). A real adapter
- * (vda5050/seer-tcp) driven by `start()`'s wall-clock `setInterval` has no
- * such guarantee: telemetry can arrive at any cadence relative to
- * `tickMs`, so a robot's reported position may already be multiple cells
- * stale (or ahead) by the time `runRouting()` reads it, which the current
- * "claim just [current, next]" reservation gate does not protect against.
- * Do not rely on the collision invariant for a real-adapter deployment
- * until proper horizon-gating (see `opts.horizon`) lands — tracked as a
- * follow-up for Task 11/12.
+ * Collision invariant: unlike a v1 design that depended on lockstep
+ * interleaving of adapter ticks and orchestrator ticks (PIBT computing
+ * moves once per tick over every robot's TRUE, freshly-synced position),
+ * the invariant here rests on the ReservationTable: no cell is ever double
+ * -granted, and a leg only ever advances past a claim that fully succeeded.
+ * This holds regardless of adapter cadence — a physical robot may lag its
+ * commanded frontier by any amount up to `opts.horizon`, and reservations
+ * (not lockstep) are what keep two robots' committed windows disjoint.
+ *
+ * Known accepted limitation (BACKLOG, not fixed here): a parked IDLE robot
+ * sitting on the only path into an order's pickup/drop permanently owns
+ * that cell but is never itself commanded to move out of the way — PIBT
+ * only ever pushes it virtually, never dispatches an actual parking move.
+ * Such an order blocks every extension attempt until the deadlock backstop
+ * (`opts.blockedTicksLimit` consecutive fully-blocked ticks) requeues it;
+ * after 3 requeues OrderBook fails it outright rather than ever routing
+ * around the parked robot.
  */
 export class Orchestrator {
   private readonly map: WarehouseMap;
@@ -147,6 +162,7 @@ export class Orchestrator {
       tickMs: opts?.tickMs ?? 500,
       horizon: opts?.horizon ?? 5,
       offlineGraceMs: opts?.offlineGraceMs ?? 10_000,
+      blockedTicksLimit: opts?.blockedTicksLimit ?? 20,
       now: opts?.now,
     };
     this.router = new PibtRouter(map);
@@ -233,6 +249,11 @@ export class Orchestrator {
     return [...this.alarms];
   }
 
+  /** Test/debug hook: reservation-table ownership pass-through, for asserting collision-hole-free recovery around the deadlock backstop. */
+  _reservationOwner(cell: CellKey): RobotId | undefined {
+    return this.reservations.owner(cell);
+  }
+
   // ---- tick pipeline -----------------------------------------------------
 
   private runTick(): void {
@@ -241,6 +262,28 @@ export class Orchestrator {
     // unhandled error that can crash the process. Log and skip the rest of
     // this tick rather than taking the whole fleet down; the next tick
     // gets a fresh chance.
+    //
+    // Ordering invariant — own-cell reservation ownership after
+    // releaseAll()/setLeg(undefined): resolveCurrentNodes() (step 2,
+    // below) is what normally re-establishes an idle robot's ownership of
+    // the cell it's physically sitting on (see its own "idle robots own
+    // their cell" claim). Any path that calls
+    // `this.reservations.releaseAll(id)` + `setLeg(rt, undefined)` DURING
+    // event draining (step 1 — e.g. handleMissionDone's premature-guard,
+    // handleMissionFailed, verifyReportingRobot's stale-report cleanup)
+    // can safely rely on resolveCurrentNodes() running immediately
+    // afterward, same tick, to re-claim that cell before runDispatch/
+    // runRouting (steps 4-5) ever run. Any release path that instead runs
+    // AFTER resolveCurrentNodes() — currently handleOfflineTimeouts()
+    // (step 3) and requeueBlockedLeg() (called from within runRouting(),
+    // step 5) — has NO such safety net for the remainder of THIS tick, and
+    // MUST re-claim the robot's own current cell itself, synchronously,
+    // right after its own releaseAll() call, or the cell is left unowned
+    // (claimable by another robot processed later this tick, and
+    // unrecoverable by this robot's own idle re-claim next tick, since
+    // claim() is a no-op on an empty/foreign-owned grant) — see
+    // requeueBlockedLeg() and handleOfflineTimeouts() for the concrete
+    // fix shape.
     try {
       this.tickCount++;
       const events = this.eventQueue.splice(0, this.eventQueue.length);
@@ -420,11 +463,96 @@ export class Orchestrator {
     // "stale report" case already handled below via book.transition()'s
     // own try/catch, and must NOT be touched here.
     if (rt.leg && rt.leg.missionId === missionId) {
-      const reachedGoal = rt.currentNodeId === rt.leg.goalNode || rt.lastVdaNodeId === rt.leg.goalNode;
+      const currentLeg = rt.leg;
+      const reachedGoal = rt.currentNodeId === currentLeg.goalNode || rt.lastVdaNodeId === currentLeg.goalNode;
       if (!reachedGoal) {
+        // Task 2 regression fix: under horizon-gated/reservation-blocked
+        // extension, the orchestrator can DELIBERATELY send a mission
+        // shorter than the leg's true goal (paused by opts.horizon, or by
+        // sustained reservation contention) — and a real adapter
+        // truthfully reports THAT sent mission as fully processed the
+        // moment the robot finishes walking it, regardless of whether it
+        // matches the leg's eventual goal: Vda5050Adapter's
+        // handleOrderProcessed() `!active` branch and FakeAdapter.tick()'s
+        // `currentNodeIndex >= nodeIds.length` check both only know about
+        // the specific path they were told to walk, never about the leg's
+        // goal. Distinguish that legitimate "committed prefix fully
+        // executed" case from a genuinely premature/corrupt report: if the
+        // robot's batch-fresh node is exactly the leg's committed FRONTIER
+        // (the last node it was actually sent), this is case (a) — resume,
+        // don't cancel+requeue. Anything else (robot short of even its own
+        // frontier) is case (b), a genuine frontier race / corrupt report —
+        // falls through to the existing cancel+requeue path unchanged.
+        // Mirror reachedGoal's dual-signal check (currentNodeId OR
+        // lastVdaNodeId), not just currentNodeId: under a real
+        // Vda5050Adapter, the AGV's own reported lastNodeId
+        // (rt.lastVdaNodeId) can reach the frontier a full batch ahead of
+        // the position-snap-derived currentNodeId — the exact race
+        // RobotRuntime.lastVdaNodeId's doc comment describes. Checking
+        // currentNodeId alone would spuriously read "not at frontier" in
+        // that window and misroute a legitimately-finished robot into the
+        // genuine-premature cancel+requeue branch below — a narrower
+        // reintroduction of this same regression, just gated on which
+        // signal arrives first instead of on horizon/contention pacing.
+        const frontierNode = currentLeg.nodeIds[currentLeg.nodeIds.length - 1];
+        const atFrontier =
+          currentLeg.nodeIds.length > 0 &&
+          (rt.currentNodeId === frontierNode || rt.lastVdaNodeId === frontierNode);
+        if (atFrontier) {
+          // Resume: reseed the leg from the CONFIRMED frontier position
+          // exactly like a freshly-created leg, so runRouting() sends a
+          // brand-new mission attempt under the SAME missionId next tick,
+          // and extension naturally continues once opts.horizon/reservation
+          // contention allows. Both adapters treat a post-done send under a
+          // reused missionId as a fresh attempt (Vda5050Adapter mints a new
+          // `${missionId}#n`; FakeAdapter already cleared `robot.mission`
+          // the instant it fired this very missionDone event, synchronously,
+          // before this handler even runs) — and FakeAdapter's "new
+          // mission" branch sets the robot's position to the FIRST node of
+          // the sent path, so nodeIds MUST start at the robot's true
+          // current node. Seed with `frontierNode` itself — NOT
+          // `rt.currentNodeId` — since atFrontier can be true purely via
+          // `rt.lastVdaNodeId` while `rt.currentNodeId` is still stale
+          // (possibly even `undefined`); frontierNode IS whichever signal
+          // confirmed arrival, matching reachedGoal's own established
+          // precedent of trusting lastVdaNodeId as authoritative over a
+          // disagreeing/absent position snap (progressIndex reset to 0
+          // keeps it monotonic: 0 is always a valid — and here the only —
+          // index into the new, single-element nodeIds).
+          this.alarms.push(
+            `t=${this.tickCount} committed path complete (not yet leg goal) for robot ${robotId}, ` +
+              `order ${orderId} (leg=${leg}, at=${String(rt.currentNodeId)}, lastVdaNodeId=${String(rt.lastVdaNodeId)}, ` +
+              `goal=${currentLeg.goalNode}) — resuming, not requeueing`
+          );
+          currentLeg.nodeIds = [frontierNode!];
+          currentLeg.progressIndex = 0;
+          // Deliberately NOT resetting blockedTicks here: doing so proved to
+          // be its own deadlock — a robot with NO viable further extension
+          // (e.g. genuinely, permanently blocked by another parked robot)
+          // completes this trivial "already there" 1-node re-send instantly
+          // every tick, re-entering this exact resume branch every single
+          // time; unconditionally zeroing blockedTicks on every resume
+          // silently absorbed the deadlock backstop's counter before it
+          // could ever reach opts.blockedTicksLimit, leaving the order
+          // hung "dispatched" forever instead of ever reaching the
+          // backstop or genuinely completing. blockedTicks must only ever
+          // be reset by GENUINE forward progress — runRouting()'s own
+          // progress-scan (which advances progressIndex to a NEW, higher
+          // index) already does exactly that, unconditionally, on real
+          // movement, and its successful-extension branch resets it too.
+          // Leaving it untouched here means: if this robot is truly stuck,
+          // repeated resume-then-immediately-redone cycles correctly keep
+          // accumulating blockedTicks (nothing else resets it) until the
+          // deadlock backstop fires; if it's genuinely progressing (just
+          // pacing out its horizon), the very next successful extension
+          // resets it via that existing path regardless.
+          currentLeg.sent = false;
+          return;
+        }
+
         this.alarms.push(
           `t=${this.tickCount} premature missionDone from robot ${robotId} for order ${orderId} ` +
-            `(leg=${leg}, at=${String(rt.currentNodeId)}, lastVdaNodeId=${String(rt.lastVdaNodeId)}, goal=${rt.leg.goalNode}) — cancelling and requeueing`
+            `(leg=${leg}, at=${String(rt.currentNodeId)}, lastVdaNodeId=${String(rt.lastVdaNodeId)}, goal=${currentLeg.goalNode}) — cancelling and requeueing`
         );
         void this.adapter.cancelMission(robotId).catch(() => {
           /* best-effort; robot may be unreachable */
@@ -453,6 +581,8 @@ export class Orchestrator {
         missionId: `${orderId}:drop`,
         nodeIds: [], // seeded once this tick's current node is resolved
         sent: false,
+        progressIndex: 0,
+        blockedTicks: 0,
       });
     } else {
       try {
@@ -559,6 +689,26 @@ export class Orchestrator {
 
       rt.currentNodeId = nodeId;
       this.reservations.release(id, cellKey(this.map.node(nodeId).pos));
+      if (!rt.leg) {
+        // Idle robots always own the cell they are parked on, so no other
+        // robot's committed window can ever be granted through them.
+        const idleCell = cellKey(this.map.node(nodeId).pos);
+        const granted = this.reservations.claim(id, [idleCell]);
+        if (granted.length === 0) {
+          // Should be unreachable in a correctly-functioning fleet — the
+          // only way another robot could already foreign-own the cell
+          // THIS robot is physically standing on is a prior collision-hole
+          // bug (see runTick()'s ordering-invariant note and
+          // requeueBlockedLeg()/handleOfflineTimeouts()'s own-cell
+          // re-claims). Alarmed here, not silently swallowed, so the "idle
+          // robots own their cell" invariant is directly observable if it
+          // is ever violated again.
+          this.alarms.push(
+            `t=${this.tickCount} robot ${id} idle self-claim of ${idleCell} DENIED ` +
+              `(owner=${String(this.reservations.owner(idleCell))}) — collision-hole invariant violated`
+          );
+        }
+      }
       if (rt.leg && rt.leg.nodeIds.length === 0) {
         rt.leg.nodeIds = [nodeId];
       }
@@ -587,6 +737,25 @@ export class Orchestrator {
         }
       }
       this.reservations.releaseAll(id);
+      // Re-claim the robot's own physically-occupied cell immediately —
+      // same collision-hole fix as requeueBlockedLeg(), and needed here
+      // for the same reason: this runs at pipeline step 3
+      // (handleOfflineTimeouts), AFTER resolveCurrentNodes() (step 2)
+      // already ran this tick, so nothing else re-establishes ownership
+      // before runRouting() (step 5) runs later THIS SAME tick. Without
+      // this, the offline robot's cell is unowned for the rest of this
+      // tick's runRouting() — another robot's committed window can get a
+      // FULL grant through it (PIBT still pushes the frozen robot
+      // virtually, so it doesn't stop that OTHER robot's proposed move
+      // either) — and on the VERY NEXT tick, resolveCurrentNodes()'s own
+      // idle re-claim for this robot would then see the cell as
+      // foreign-owned and never recover it: a permanent collision hole
+      // where a traveling robot's commanded path drives straight through
+      // where the frozen, offline robot physically still sits. See the
+      // ordering invariant noted on runTick().
+      if (rt.currentNodeId !== undefined) {
+        this.reservations.claim(id, [cellKey(this.map.node(rt.currentNodeId).pos)]);
+      }
       setLeg(rt, undefined);
       void this.adapter.cancelMission(id).catch(() => {
         /* best-effort; robot is unreachable anyway */
@@ -641,24 +810,46 @@ export class Orchestrator {
         missionId: `${order.id}:pick`,
         nodeIds: [rt.currentNodeId],
         sent: false,
+        progressIndex: 0,
+        blockedTicks: 0,
       });
     }
   }
 
   /**
-   * LOCKSTEP PRECONDITION: the zero-collision guarantee below rests
-   * entirely on `this.router.step()` being called once per tick over every
-   * robot's TRUE current position, with robot movement and orchestrator
-   * ticks interleaved one-for-one (see the class-level doc comment). Under
-   * a wall-clock `start()` timer against a real adapter, that assumption
-   * does not automatically hold — flagged as a Task 11/12 follow-up.
+   * PIBT plans over each legged robot's committed FRONTIER (the last node
+   * of its currently-sent path), not its true physical position — a
+   * virtual configuration that plans ahead of the physical robots. This
+   * keeps appended moves adjacent to the frontier by construction (no more
+   * geometrically invalid paths from stitching a true-position move onto a
+   * stale frontier), and the zero-collision guarantee no longer depends on
+   * lockstep interleaving of adapter ticks and orchestrator ticks: it rests
+   * on the ReservationTable, which is the source of truth for committed
+   * cells and is checked (and only committed to on a full grant) on every
+   * extension below, regardless of adapter cadence.
+   *
+   * Known accepted limitation (BACKLOG, not fixed here): a parked IDLE
+   * robot sitting on the only path into an order's pickup/drop permanently
+   * owns that cell (see resolveCurrentNodes()) but is never itself
+   * commanded to move out of the way — PIBT only ever pushes it virtually.
+   * Such an order blocks forever until the deadlock backstop below
+   * requeues it, and after 3 requeues OrderBook fails it outright, rather
+   * than ever being routed around the parked robot.
    */
   private runRouting(): void {
     const agents: Agent[] = [];
     for (const [id, rt] of this.robots) {
       if (rt.quarantined || rt.currentNodeId === undefined) continue;
-      const goal = rt.leg ? rt.leg.goalNode : rt.currentNodeId;
-      agents.push({ id, at: rt.currentNodeId, goal, priority: 0 });
+      if (rt.leg && rt.leg.nodeIds.length > 0) {
+        // Plan from the leg's commanded FRONTIER, not the robot's true
+        // position: appended moves are then adjacent to the frontier by
+        // construction, and the planned configuration stays internally
+        // consistent even when physical robots lag behind their frontiers.
+        const frontier = rt.leg.nodeIds[rt.leg.nodeIds.length - 1]!;
+        agents.push({ id, at: frontier, goal: rt.leg.goalNode, priority: 0 });
+      } else {
+        agents.push({ id, at: rt.currentNodeId, goal: rt.currentNodeId, priority: 0 });
+      }
     }
     if (agents.length === 0) return;
 
@@ -667,41 +858,147 @@ export class Orchestrator {
     for (const [id, rt] of this.robots) {
       if (!rt.leg || rt.currentNodeId === undefined) continue;
       const leg = rt.leg;
-      const lastNode = leg.nodeIds[leg.nodeIds.length - 1];
+      if (leg.nodeIds.length === 0) continue; // seeded next resolveCurrentNodes pass
+
+      // Advance monotonic progress: first match of the robot's current
+      // node at or after the previous progress index (paths may revisit
+      // nodes; the robot traverses them in order, so never scan backward).
+      for (let j = leg.progressIndex; j < leg.nodeIds.length; j++) {
+        if (leg.nodeIds[j] === rt.currentNodeId) {
+          if (j > leg.progressIndex) {
+            leg.progressIndex = j;
+            leg.blockedTicks = 0; // physical progress = not deadlocked
+          }
+          break;
+        }
+      }
+
+      const frontierIndex = leg.nodeIds.length - 1;
+      const frontierNode = leg.nodeIds[frontierIndex]!;
+      const lag = frontierIndex - leg.progressIndex;
       let changed = false;
 
-      if (lastNode !== leg.goalNode) {
-        const nextNode = moves.get(id) ?? rt.currentNodeId;
-        leg.nodeIds.push(nextNode);
-        changed = true;
+      if (frontierNode !== leg.goalNode && lag < this.opts.horizon) {
+        const nextNode = moves.get(id);
+        if (nextNode !== undefined && nextNode !== frontierNode) {
+          // Claim the ENTIRE uncommitted window [current .. candidate] in
+          // path order (reservation contract: current cell first). Commit
+          // the extension only on a FULL grant — reservations are the
+          // source of truth for commanded paths, never advisory.
+          const window = leg.nodeIds.slice(leg.progressIndex);
+          window.push(nextNode);
+          const claimCells = window.map((n) => cellKey(this.map.node(n).pos));
+          // claim() dedupes path revisits internally, so the grant it can
+          // ever return is capped at the number of DISTINCT cells in the
+          // window — compare/index against that deduped list, not the raw
+          // (possibly-revisiting) one, or a revisited window both
+          // mis-detects a full grant as partial and names the wrong denied
+          // cell (finding: minor 6).
+          const dedupedCells = Array.from(new Set(claimCells));
+          const granted = this.reservations.claim(id, claimCells);
+          if (granted.length === dedupedCells.length) {
+            leg.nodeIds.push(nextNode);
+            leg.blockedTicks = 0;
+            changed = true;
+          } else {
+            leg.blockedTicks++;
+            const deniedCell = dedupedCells[granted.length] ?? dedupedCells[0]!;
+            this.alarms.push(
+              `t=${this.tickCount} contention: robot ${id} blocked at ${deniedCell} ` +
+                `(owner=${String(this.reservations.owner(deniedCell))}, blockedTicks=${leg.blockedTicks})`
+            );
+            if (leg.blockedTicks >= this.opts.blockedTicksLimit) {
+              this.requeueBlockedLeg(id, rt, leg, deniedCell);
+              continue;
+            }
+          }
+        } else {
+          // PIBT offered no forward candidate this tick — either it
+          // returned nothing, or (the canonical case) it resolved to
+          // "stay" because the only cell that makes progress is occupied
+          // by another PIBT-visible agent, e.g. a parked idle robot (see
+          // resolveCurrentNodes()): PIBT's own collision avoidance simply
+          // never proposes stepping onto it, so there is no claim() to
+          // even attempt against a foreign owner. Sustained inability to
+          // advance is sustained inability to advance regardless of which
+          // layer reports it — count it as a blocked tick too, so the
+          // deadlock backstop still fires for the parked-robot-blocks-the
+          // -corridor case, not only for claim() rejections.
+          leg.blockedTicks++;
+          const stuckCell = cellKey(this.map.node(frontierNode).pos);
+          this.alarms.push(
+            `t=${this.tickCount} contention: robot ${id} blocked at ${stuckCell} ` +
+              `(no forward candidate, blockedTicks=${leg.blockedTicks})`
+          );
+          if (leg.blockedTicks >= this.opts.blockedTicksLimit) {
+            this.requeueBlockedLeg(id, rt, leg, stuckCell);
+            continue;
+          }
+        }
       }
 
       if (!leg.sent || changed) {
-        const currentCell = cellKey(this.map.node(rt.currentNodeId).pos);
-        const aheadNode = leg.nodeIds[leg.nodeIds.length - 1];
-        const aheadCell = cellKey(this.map.node(aheadNode).pos);
-        const claimCells: CellKey[] =
-          currentCell === aheadCell ? [currentCell] : [currentCell, aheadCell];
-
-        const granted = this.reservations.claim(id, claimCells);
-        if (granted.length < claimCells.length) {
-          // v1 simplification: reservation contention is logged as a safety-net
-          // alarm but does not block sending the mission — PIBT's step() call
-          // above already guarantees this tick's moves are collision-free.
-          this.alarms.push(
-            `t=${this.tickCount} contention: robot ${id} could not claim ${aheadCell} (owner=${String(this.reservations.owner(aheadCell))})`
-          );
-        }
-
         const missionId = leg.missionId;
         const nodeIds = [...leg.nodeIds];
         void this.adapter
           .sendMission({ id: missionId, robotId: id, nodeIds }, this.map)
           .catch((err) => {
             this.alarms.push(`t=${this.tickCount} sendMission failed for ${id}: ${String(err)}`);
+            // Retry next tick: a rejected send is otherwise never retried
+            // once nothing else changes (gated extension means the same
+            // nodeIds may not get appended again for a while), hanging the
+            // order with no backstop — claim()s can keep succeeding even
+            // while the adapter itself keeps rejecting sends. Guard on leg
+            // IDENTITY: rt.leg may have been cleared or replaced (leg
+            // completed, requeued via an unrelated path, deadlock
+            // backstop) while this promise was in flight — only touch the
+            // SAME leg object this send was actually for. A resend after a
+            // genuinely failed send is a brand-new mission from the
+            // adapter's point of view (it recorded nothing), so this can
+            // never trip the adapter's strict-prefix check.
+            if (rt.leg === leg) {
+              leg.sent = false;
+            }
           });
         leg.sent = true;
       }
     }
+  }
+
+  /**
+   * Deadlock backstop recovery: cancel the robot's mission, requeue its
+   * order (OrderBook's 3-retry cap then fails it outright rather than
+   * hanging forever), release all of the robot's reservation holds, and
+   * clear its leg — the same recovery shape as handleMissionFailed().
+   *
+   * Critical fix: release + re-claim must happen together, synchronously,
+   * right here. releaseAll() alone would leave the robot's own
+   * physically-occupied cell unowned for the REMAINDER of this tick's
+   * runRouting() loop (resolveCurrentNodes() — which is what normally
+   * claims an idle robot's current cell — already ran earlier this same
+   * tick), making it claimable by any OTHER robot processed later in this
+   * same loop. Worse, on the VERY NEXT tick, resolveCurrentNodes()'s idle
+   * re-claim for THIS robot would then see the cell as foreign-owned and
+   * get an empty grant (claim() is a no-op on empty grant), so the robot
+   * would never recover ownership of the cell it is still physically
+   * sitting on — a genuine collision hole.
+   */
+  private requeueBlockedLeg(id: RobotId, rt: RobotRuntime, leg: RobotLeg, deniedCell: CellKey): void {
+    this.alarms.push(
+      `t=${this.tickCount} robot ${id} blocked ${leg.blockedTicks} ticks at ${deniedCell} — requeueing order ${leg.orderId}`
+    );
+    void this.adapter.cancelMission(id).catch(() => {
+      /* best-effort */
+    });
+    try {
+      this.book.requeue(leg.orderId, "sustained reservation contention");
+    } catch {
+      /* already terminal */
+    }
+    this.reservations.releaseAll(id);
+    if (rt.currentNodeId !== undefined) {
+      this.reservations.claim(id, [cellKey(this.map.node(rt.currentNodeId).pos)]);
+    }
+    setLeg(rt, undefined);
   }
 }

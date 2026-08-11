@@ -32,23 +32,23 @@ function mulberry32(seed: number): () => number {
  *
  * Why bounded rather than fully uniform-random across the whole 200-node
  * grid (this function's first implementation, during development):
- * `Orchestrator.runRouting()` re-sends a VDA5050 stitching order-update on
- * EVERY tick a leg isn't yet at its goal (`packages/orchestrator/src/orchestrator.ts`,
- * `runRouting()` — `if (lastNode !== leg.goalNode) { leg.nodeIds.push(...) }`
- * is unconditional per tick, not gated on the robot having caught up to the
- * previously-sent frontier). Confirmed empirically (see task-12-report.md's
- * "Finding" section, reproduced with a single, zero-contention robot) that
- * once a single leg exceeds roughly 5-6 cells, this floods the real
- * `Vda5050Adapter`/`AgvController` pair with an order-update every ~200ms
- * for the leg's ENTIRE remaining duration, and real wall-clock progress
- * degrades to roughly 20+ seconds PER CELL instead of the nominal
- * ~0.5s/cell — unrelated to PIBT contention (reproduced with zero other
- * robots involved) and not something fixable from within `packages/sim`.
- * Both the dispatch leg (robot's current position -> pickup) and the haul
- * leg (pickup -> drop) are kept short here so the fleet's real per-order
- * latency stays inside this task's time budget; see the report for the
- * full repro and the case for treating this as a pre-existing
- * orchestrator-level finding, not a gap in this test.
+ * `Orchestrator.runRouting()` used to re-send a VDA5050 stitching
+ * order-update on EVERY tick a leg wasn't yet at its goal, unconditional on
+ * the robot having caught up to the previously-sent frontier. Confirmed
+ * empirically (see task-12-report.md's "Finding" section, reproduced with a
+ * single, zero-contention robot) that once a single leg exceeded roughly
+ * 5-6 cells, this flooded the real `Vda5050Adapter`/`AgvController` pair
+ * with an order-update every ~200ms for the leg's ENTIRE remaining
+ * duration, and real wall-clock progress degraded to roughly 20+ seconds
+ * PER CELL instead of the nominal ~0.5s/cell — unrelated to PIBT contention
+ * (reproduced with zero other robots involved). Task 2 (commits 30355ee,
+ * a808916) fixed the root cause with horizon-gated frontier planning:
+ * `runRouting()` now only extends a mission once the robot is within
+ * `horizon` nodes of the commanded frontier, so the flood no longer occurs
+ * (see the 1-robot 9-cell latency test below, which proves it directly).
+ * The pickup/drop pairs here stay bounded regardless, since a short haul
+ * distance keeps this soak's per-order latency budget tight and the test
+ * focused on fleet-scale contention rather than long-haul routing.
  */
 function seededOrderSpecs(
   map: WarehouseMap,
@@ -190,7 +190,7 @@ async function buildFleetAndOrchestrator(
 
 describe.sequential("sim fleet E2E soak (packages/sim)", () => {
   it(
-    "10-robot / 20-order soak on the uncurated 20x10 demo grid: within 5min, >=90% completed (honest threshold, see comments), sustained collisions logged not gated, sane KPIs",
+    "10-robot / 20-order soak on the uncurated 20x10 demo grid: within 5min, >=95% completed, zero sustained collisions (hard gate), sane KPIs",
     async () => {
       const map = await loadMap();
       const ROBOTS = 10;
@@ -294,56 +294,28 @@ describe.sequential("sim fleet E2E soak (packages/sim)", () => {
           );
         }
 
-        // Collision gate — DOWNGRADED from hard-fail to logged finding.
-        // The brief specified: hard-fail only on a SUSTAINED overlap (same
-        // pair, same cell, 3+ consecutive samples); empirically, this
-        // fleet at this scale produces sustained overlaps on every run
-        // (16 distinct pairs observed in the run this threshold was set
-        // against — see task-12-report.md's Finding section for the full
-        // list and root-cause analysis). This is not test flakiness: it is
-        // the exact gap `Orchestrator.runRouting()`'s own "LOCKSTEP
-        // PRECONDITION" doc comment already flags ("Do not rely on the
-        // collision invariant for a real-adapter deployment until proper
-        // horizon-gating... lands — tracked as a follow-up for Task
-        // 11/12") and that task-11-report.md's "Known limitation" section
-        // already found in miniature (3 robots, curated layout, avoided
-        // rather than triggered). This task's 10-robot uncurated soak is
-        // the first place it's actually been forced to happen and
-        // measured. Per the brief's own escape valve for the completion-
-        // rate gate ("find the honest max threshold the system sustains...
-        // that is a FINDING for the final review, not a failure of your
-        // task"), the same treatment is applied here: log every sustained
-        // overlap with full context (already done above) instead of
-        // hard-failing on a bar the current orchestrator cannot meet.
-        // Restoring this to `expect(collisions.sustained).toEqual([])`
-        // is the correct regression gate once horizon-gating lands.
-        if (collisions.sustained.length > 0) {
-          // eslint-disable-next-line no-console
-          console.warn(
-            `[soak] ${collisions.sustained.length} SUSTAINED same-cell collisions (known, pre-existing, unresolved orchestrator gap — see comment above and task-12-report.md):\n` +
-              collisions.sustained.join("\n")
-          );
-        }
+        // Collision gate — hard-fail on any SUSTAINED overlap (same pair,
+        // same cell, 3+ consecutive samples). This was DOWNGRADED to a
+        // logged finding while `Orchestrator.runRouting()` unconditionally
+        // extended missions by a cell every tick regardless of the robot's
+        // actual progress toward the previously-commanded frontier — see
+        // task-12-report.md's Finding section for the original root-cause
+        // analysis. Task 2 (commits 30355ee, a808916) fixed that: mission
+        // extension is now horizon-gated (only extends once the robot is
+        // within `horizon` nodes of the commanded frontier), reservations
+        // are blocking, and a deadlock backstop force-requeues genuinely
+        // stuck robots — closing the drift that let two robots' commanded
+        // frontiers land on the same contested cell for real. This is now
+        // the correct regression gate.
+        expect(collisions.sustained, collisions.sustained.join("\n")).toEqual([]);
 
-        // Completion-rate gate — set to an HONEST empirically-measured
-        // threshold, not the brief's original 95%. See task-12-report.md's
-        // Finding section for the full data: across repeated runs of this
-        // exact test during development, completion ranged 95-100% (20/20
-        // or 19/20 of 20 orders), with the shortfall in every sub-100% run
-        // traced to the SAME root cause — 1-2 orders whose robots entered
-        // a genuine, sustained (not transient) reservation deadlock with
-        // another robot over a single cell, which does not resolve given
-        // more time. This is the mission-extension-flood mechanism
-        // documented in `seededOrderSpecs`'s doc comment above (unconditional
-        // per-tick single-cell extension is what lets two robots' commanded
-        // frontiers drift onto the same contested cell for real, not just
-        // PIBT's per-tick collision-free guarantee on TRUE positions, which
-        // still holds) — a pre-existing `packages/orchestrator` gap, out of
-        // this task's scope to fix. 90% (18/20) leaves headroom below the
-        // observed 95% floor while still catching a real regression (e.g.
-        // most orders failing/never dispatching) rather than just this
-        // known, bounded, few-orders-stuck failure mode.
-        expect(completionRate, `completion rate ${(completionRate * 100).toFixed(1)}% (${completedCount}/${ORDER_COUNT})`).toBeGreaterThanOrEqual(0.9);
+        // Completion-rate gate — raised to 95%, the floor the fix in
+        // commits 30355ee/a808916 (Task 2, horizon-gated frontier planning
+        // + blocking reservations + deadlock backstop) restores. The prior
+        // 90% "honest" threshold existed only to tolerate the mission-
+        // extension-flood mechanism documented in `seededOrderSpecs`'s doc
+        // comment above, which that fix eliminates.
+        expect(completionRate, `completion rate ${(completionRate * 100).toFixed(1)}% (${completedCount}/${ORDER_COUNT})`).toBeGreaterThanOrEqual(0.95);
 
         expect(finalSnap.kpis.ordersPerHour).toBeGreaterThan(0);
         expect(finalSnap.kpis.utilization).toBeGreaterThanOrEqual(0);
@@ -523,5 +495,78 @@ describe.sequential("sim fleet E2E soak (packages/sim)", () => {
       }
     },
     5 * 60_000
+  );
+
+  it(
+    "a single robot completes a 9-cell leg at seconds-per-cell pace (no extension flood)",
+    async () => {
+      // Pre-fix baseline: >180s for 9 cells (~20s/cell, see the mission-
+      // extension-flood mechanism formerly documented in seededOrderSpecs's
+      // doc comment above). Post-fix budget is deliberately generous — 45s
+      // wall — while still impossible under the flood regime.
+      const map = await loadMap();
+      const POLL_MS = 200;
+      const POLL_DEADLINE_MS = 45_000;
+      // A single robot spawns on the sole charger start node (n0_0, see
+      // `fleet.ts`'s `pickStartNodes`). n9_0 is a straight 9-cell hop east
+      // of it on the demo grid; n10_0 is one cell further and adjacent to
+      // the pickup, so the haul leg is trivial and the measured section is
+      // effectively the 9-cell dispatch leg.
+      const PICKUP = "n9_0";
+      const DROP = "n10_0";
+
+      let devBroker: DevBrokerResult | undefined;
+      let fleet: SpawnedFleet | undefined;
+      let adapter: Vda5050Adapter | undefined;
+      let orchestrator: Orchestrator | undefined;
+
+      try {
+        devBroker = await startDevBroker({ port: 0, wsPort: 0 });
+        // Built inline (not via `buildFleetAndOrchestrator`) so the
+        // orchestrator runs at its default tickMs rather than the 200ms the
+        // fleet-scale tests pin above — this test is about latency under
+        // normal orchestrator pacing, not about matching AgvController's
+        // publishStateInterval exactly.
+        fleet = await spawnFleet({ mapPath: MAP_PATH, robots: 1, mqttUrl: devBroker.url });
+        adapter = new Vda5050Adapter(
+          fleet.agvIds.map((serialNumber) => ({ manufacturer: "tez", serialNumber })),
+          devBroker.url,
+          { interfaceName: "uagv" }
+        );
+        orchestrator = new Orchestrator(map, adapter);
+        await orchestrator.start();
+
+        const startMs = Date.now();
+        const order = orchestrator.submitOrder(PICKUP, DROP);
+
+        let finalStatus: string | undefined;
+        const deadlineAt = startMs + POLL_DEADLINE_MS;
+        while (Date.now() < deadlineAt) {
+          const snap = orchestrator.snapshot();
+          finalStatus = snap.orders.find((o) => o.id === order.id)?.status;
+          if (finalStatus === "completed" || finalStatus === "failed" || finalStatus === "canceled") break;
+          await new Promise((r) => setTimeout(r, POLL_MS));
+        }
+        const wallMs = Date.now() - startMs;
+
+        // eslint-disable-next-line no-console
+        console.log(
+          "[latency] 1-robot 9-cell leg wallMs=%d status=%s",
+          wallMs,
+          finalStatus
+        );
+
+        expect(
+          finalStatus,
+          `order did not complete within ${POLL_DEADLINE_MS}ms (wallMs=${wallMs}) — possible extension-flood regression`
+        ).toBe("completed");
+      } finally {
+        if (orchestrator) await orchestrator.stop();
+        if (adapter) await adapter.stop();
+        if (fleet) await fleet.stop();
+        if (devBroker) await devBroker.close();
+      }
+    },
+    60_000
   );
 });
