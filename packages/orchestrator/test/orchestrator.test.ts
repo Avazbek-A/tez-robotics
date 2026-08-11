@@ -866,6 +866,90 @@ describe("Orchestrator", () => {
       expect(orchestrator.getAlarms().some((a) => a.includes("premature missionDone"))).toBe(false);
       expect(orchestrator.getAlarms().some((a) => a.includes("resuming, not requeueing"))).toBe(true);
     });
+
+    it("(e) committed-path-complete resume via authoritative lastVdaNodeId, even when a stale state event's position snap disagrees", () => {
+      // Regression test for a fix-round-3 review finding on test (d)'s own
+      // fix: atFrontier originally checked ONLY rt.currentNodeId, mirroring
+      // neither reachedGoal's dual-signal check three lines above it nor
+      // test (c)'s own precedent (accepting a done report via authoritative
+      // lastVdaNodeId even when a same-batch state event's snap disagrees).
+      // Under a real Vda5050Adapter, the AGV's own reported lastNodeId can
+      // reach the FRONTIER a full batch ahead of the position-snap-derived
+      // currentNodeId (see RobotRuntime.lastVdaNodeId's doc comment) —
+      // checking currentNodeId alone would then spuriously read "not at
+      // frontier" and misroute a legitimately-finished robot into the
+      // genuine-premature cancel+requeue branch: a narrower reintroduction
+      // of this same class of regression, gated on signal arrival order
+      // instead of horizon/contention pacing. FakeAdapter's own tick()-
+      // driven simulation can never exercise this (missionProgress for the
+      // frontier always precedes missionDone by a full tick there), so this
+      // uses ScriptableAdapter.injectEvent to construct the race directly:
+      // inject missionProgress confirming the frontier (sets both
+      // rt.lastVdaNodeId AND rt.currentNodeId, per handleEvent's
+      // "missionProgress" case), then a stale "state" event reporting the
+      // PREVIOUS node (the "state" handler unconditionally re-derives
+      // currentNodeId from the reported pos, regressing it behind
+      // lastVdaNodeId — exactly test (c)'s own technique), then missionDone.
+      const map = grid(5);
+      const adapter = new ScriptableAdapter([{ id: "r1", startNodeId: "n0_0" }], map);
+      // Small horizon so the pick leg's frontier caps well short of the
+      // pickup goal (n0_0 -> n1_0 -> n2_0, horizon 2, goal n4_0).
+      const orchestrator = new Orchestrator(map, adapter, { horizon: 2 });
+      adapter.tick();
+      orchestrator.tickOnce();
+      const order = orchestrator.submitOrder("n4_0", "n0_0");
+
+      // Dispatch + first extension attempt(s).
+      orchestrator.tickOnce();
+      // One physical step: robot moves to n1_0, one behind the n2_0
+      // frontier the extension already committed to.
+      step(orchestrator, adapter);
+      const r1 = orchestrator.snapshot().robots.find((r) => r.id === "r1");
+      expect(r1?.pos).toEqual(map.node("n1_0").pos);
+
+      const missionId = `${order.id}:pick`;
+      adapter.injectEvent({
+        type: "missionProgress",
+        robotId: "r1",
+        missionId,
+        lastNodeId: "n2_0",
+      });
+      adapter.injectEvent({
+        type: "state",
+        state: { ...r1!, pos: map.node("n1_0").pos, status: "EXECUTING" },
+      });
+      adapter.injectEvent({ type: "missionDone", robotId: "r1", missionId });
+      orchestrator.tickOnce();
+
+      // Core assertion: the race resumes, it does NOT requeue.
+      expect(orchestrator.getAlarms().some((a) => a.includes("premature missionDone"))).toBe(false);
+      expect(orchestrator.getAlarms().some((a) => a.includes("resuming, not requeueing"))).toBe(true);
+      const afterRace = orchestrator.snapshot().orders.find((o) => o.id === order.id);
+      expect(afterRace?.retries).toBe(0);
+      expect(afterRace?.status).toBe("dispatched");
+
+      // Deliberately narrowly scoped, per the review finding's own
+      // guidance: NOT continuing to drive this to full completion.
+      // ScriptableAdapter.injectEvent fabricates the missionDone directly
+      // at the orchestrator boundary, bypassing FakeAdapter's OWN internal
+      // mission bookkeeping entirely (unlike a genuine completion, which
+      // always goes through FakeAdapter's own tick()-driven
+      // currentNodeIndex/mission-clearing logic) — FakeAdapter's
+      // internal robot.mission is left tracking the ORIGINAL 3-node
+      // mission, unaware the orchestrator now believes it "done". Driving
+      // further step()s lets that stale internal mission keep physically
+      // completing on its own terms and re-fire a SECOND, genuinely
+      // conflicting missionDone for the same missionId once the
+      // orchestrator's OWN subsequent extension has already moved the
+      // frontier past where this second report arrives — a real
+      // double-completion race, but one purely of THIS TEST's
+      // construction (a real Vda5050Adapter's `this.orders.delete()`
+      // happens synchronously before its single `missionDone` emission,
+      // so it can never double-report the same wire order). Continuing
+      // this test's own physical simulation past the injected race would
+      // therefore be testing an artifact of the injection technique, not
+      // the fix.
+    });
   });
 
   describe("round-3 regression: re-quarantine after later drift off-grid", () => {

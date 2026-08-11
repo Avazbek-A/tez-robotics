@@ -461,33 +461,48 @@ export class Orchestrator {
         // don't cancel+requeue. Anything else (robot short of even its own
         // frontier) is case (b), a genuine frontier race / corrupt report —
         // falls through to the existing cancel+requeue path unchanged.
+        // Mirror reachedGoal's dual-signal check (currentNodeId OR
+        // lastVdaNodeId), not just currentNodeId: under a real
+        // Vda5050Adapter, the AGV's own reported lastNodeId
+        // (rt.lastVdaNodeId) can reach the frontier a full batch ahead of
+        // the position-snap-derived currentNodeId — the exact race
+        // RobotRuntime.lastVdaNodeId's doc comment describes. Checking
+        // currentNodeId alone would spuriously read "not at frontier" in
+        // that window and misroute a legitimately-finished robot into the
+        // genuine-premature cancel+requeue branch below — a narrower
+        // reintroduction of this same regression, just gated on which
+        // signal arrives first instead of on horizon/contention pacing.
         const frontierNode = currentLeg.nodeIds[currentLeg.nodeIds.length - 1];
         const atFrontier =
           currentLeg.nodeIds.length > 0 &&
-          rt.currentNodeId !== undefined &&
-          rt.currentNodeId === frontierNode;
+          (rt.currentNodeId === frontierNode || rt.lastVdaNodeId === frontierNode);
         if (atFrontier) {
-          // Resume: reseed the leg from the robot's current (= frontier)
-          // position exactly like a freshly-created leg, so runRouting()
-          // sends a brand-new mission attempt under the SAME missionId
-          // next tick, and extension naturally continues once
-          // opts.horizon/reservation contention allows. Both adapters
-          // treat a post-done send under a reused missionId as a fresh
-          // attempt (Vda5050Adapter mints a new `${missionId}#n`;
-          // FakeAdapter already cleared `robot.mission` the instant it
-          // fired this very missionDone event, synchronously, before this
-          // handler even runs) — and FakeAdapter's "new mission" branch
-          // sets the robot's position to the FIRST node of the sent path,
-          // so nodeIds MUST start at the robot's true current node, which
-          // it does here (progressIndex reset to 0 keeps it monotonic:
-          // 0 is always a valid — and here the only — index into the new,
-          // single-element nodeIds).
+          // Resume: reseed the leg from the CONFIRMED frontier position
+          // exactly like a freshly-created leg, so runRouting() sends a
+          // brand-new mission attempt under the SAME missionId next tick,
+          // and extension naturally continues once opts.horizon/reservation
+          // contention allows. Both adapters treat a post-done send under a
+          // reused missionId as a fresh attempt (Vda5050Adapter mints a new
+          // `${missionId}#n`; FakeAdapter already cleared `robot.mission`
+          // the instant it fired this very missionDone event, synchronously,
+          // before this handler even runs) — and FakeAdapter's "new
+          // mission" branch sets the robot's position to the FIRST node of
+          // the sent path, so nodeIds MUST start at the robot's true
+          // current node. Seed with `frontierNode` itself — NOT
+          // `rt.currentNodeId` — since atFrontier can be true purely via
+          // `rt.lastVdaNodeId` while `rt.currentNodeId` is still stale
+          // (possibly even `undefined`); frontierNode IS whichever signal
+          // confirmed arrival, matching reachedGoal's own established
+          // precedent of trusting lastVdaNodeId as authoritative over a
+          // disagreeing/absent position snap (progressIndex reset to 0
+          // keeps it monotonic: 0 is always a valid — and here the only —
+          // index into the new, single-element nodeIds).
           this.alarms.push(
             `t=${this.tickCount} committed path complete (not yet leg goal) for robot ${robotId}, ` +
-              `order ${orderId} (leg=${leg}, at=${String(rt.currentNodeId)}, goal=${currentLeg.goalNode}) ` +
-              `— resuming, not requeueing`
+              `order ${orderId} (leg=${leg}, at=${String(rt.currentNodeId)}, lastVdaNodeId=${String(rt.lastVdaNodeId)}, ` +
+              `goal=${currentLeg.goalNode}) — resuming, not requeueing`
           );
-          currentLeg.nodeIds = [rt.currentNodeId!];
+          currentLeg.nodeIds = [frontierNode!];
           currentLeg.progressIndex = 0;
           // Deliberately NOT resetting blockedTicks here: doing so proved to
           // be its own deadlock — a robot with NO viable further extension
