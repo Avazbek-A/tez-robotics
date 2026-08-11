@@ -8,9 +8,9 @@ export interface OrdersRouteOpts extends FastifyPluginOptions {
   /**
    * Optional (Task 8). When present and `?history=1` is passed to
    * GET /orders, each order's `history` field is replaced with DB rows
-   * (shape: {id, order_id, at, status, robot_id, note}) instead of the
-   * in-memory {at, from, to, reason} entries — hence `history`'s item
-   * schema below is loosely typed rather than pinned to one shape.
+   * (see `DbHistoryEntrySchema`) instead of the in-memory
+   * `InMemoryHistoryEntrySchema` entries — hence `history`'s item schema
+   * below is a union of both real shapes.
    */
   repos?: Repos;
 }
@@ -24,6 +24,30 @@ const OrderStatusSchema = Type.Union([
   Type.Literal("canceled"),
 ]);
 
+/** In-memory `TransportOrder.history` entry shape (@tez/core's OrderBook). */
+const InMemoryHistoryEntrySchema = Type.Object({
+  at: Type.String(),
+  from: OrderStatusSchema,
+  to: OrderStatusSchema,
+  reason: Type.Optional(Type.String()),
+});
+
+/**
+ * `transport_order_history` row shape, as returned by
+ * `Repos.orders.history()` (see packages/persistence/src/repos.ts). `id` is
+ * a bigserial: pglite returns it as `number`, node-postgres returns int8
+ * columns as `string` by default — both are accepted. `robot_id`/`note` are
+ * nullable columns, returned as `null` (not `undefined`) when unset.
+ */
+const DbHistoryEntrySchema = Type.Object({
+  id: Type.Union([Type.String(), Type.Number()]),
+  order_id: Type.String(),
+  at: Type.String(),
+  status: OrderStatusSchema,
+  robot_id: Type.Union([Type.String(), Type.Null()]),
+  note: Type.Union([Type.String(), Type.Null()]),
+});
+
 export const TransportOrderSchema = Type.Object({
   id: Type.String(),
   pickupNode: Type.String(),
@@ -32,10 +56,7 @@ export const TransportOrderSchema = Type.Object({
   robotId: Type.Optional(Type.String()),
   retries: Type.Number(),
   createdAt: Type.String(),
-  // Loosely typed: in-memory entries are {at,from,to,reason?}; DB-backed
-  // entries (GET /orders?history=1 with repos present) are
-  // {id,order_id,at,status,robot_id,note} — see OrdersRouteOpts.repos.
-  history: Type.Array(Type.Unknown()),
+  history: Type.Array(Type.Union([InMemoryHistoryEntrySchema, DbHistoryEntrySchema])),
 });
 
 const CreateOrderBody = Type.Object({

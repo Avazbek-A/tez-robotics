@@ -21,9 +21,23 @@ const KpiQuery = Type.Object({
 });
 type KpiQuery = Static<typeof KpiQuery>;
 
+/**
+ * `kpi_snapshots` row shape, as returned by `Repos.snapshots.kpiRange()`
+ * (see packages/persistence/src/repos.ts). `id` is a bigserial: pglite
+ * returns it as `number`, node-postgres returns int8 columns as `string` by
+ * default — both are accepted.
+ */
+const KpiRowSchema = Type.Object({
+  id: Type.Union([Type.String(), Type.Number()]),
+  at: Type.String(),
+  orders_per_hour: Type.Number(),
+  avg_cycle_ms: Type.Number(),
+  utilization: Type.Number(),
+});
+
 const KpiResponse = Type.Object({
   live: KpiSchema,
-  range: Type.Optional(Type.Union([Type.Array(Type.Unknown()), Type.Null()])),
+  range: Type.Optional(Type.Union([Type.Array(KpiRowSchema), Type.Null()])),
   note: Type.Optional(Type.String()),
 });
 

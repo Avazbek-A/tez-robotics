@@ -4,24 +4,30 @@ import { buildSystem } from "./system.js";
 import { buildServer } from "./server.js";
 import { startRecorder, type Recorder } from "./recorder.js";
 
+interface Persistence {
+  repos: Repos;
+  /** Closes the underlying driver (pg pool / pglite connection) — callers must invoke this on shutdown so buffered/disk-backed writes get flushed. */
+  close(): Promise<void>;
+}
+
 /**
- * Builds persistence (repos) per config, if configured: `databaseUrl` takes
- * precedence (real Postgres via `createPgDriver`); otherwise `pgliteDir`
- * (embedded pglite, possibly on-disk); otherwise persistence is disabled
- * (undefined) and the api runs in-memory-only, as it did before Task 8.
- * migrate() always runs before repos are handed out, so callers never see
- * an un-migrated schema.
+ * Builds persistence (repos + a close() to release the driver) per config,
+ * if configured: `databaseUrl` takes precedence (real Postgres via
+ * `createPgDriver`); otherwise `pgliteDir` (embedded pglite, possibly
+ * on-disk); otherwise persistence is disabled (undefined) and the api runs
+ * in-memory-only, as it did before Task 8. migrate() always runs before
+ * repos are handed out, so callers never see an un-migrated schema.
  */
-async function buildRepos(config: ApiConfig): Promise<Repos | undefined> {
+async function buildPersistence(config: ApiConfig): Promise<Persistence | undefined> {
   if (config.databaseUrl) {
     const driver = createPgDriver(config.databaseUrl);
     await migrate(driver);
-    return createRepos(driver);
+    return { repos: createRepos(driver), close: () => driver.close() };
   }
   if (config.pgliteDir) {
     const driver = await createPgliteDriver(config.pgliteDir);
     await migrate(driver);
-    return createRepos(driver);
+    return { repos: createRepos(driver), close: () => driver.close() };
   }
   return undefined;
 }
@@ -37,10 +43,12 @@ async function main(): Promise<void> {
   const system = await buildSystem(config);
   await system.start();
 
-  const repos = await buildRepos(config);
-  const recorder: Recorder | undefined = repos ? startRecorder(system, repos) : undefined;
+  const persistence = await buildPersistence(config);
+  const recorder: Recorder | undefined = persistence
+    ? startRecorder(system, persistence.repos)
+    : undefined;
 
-  const app = await buildServer(system, { config, repos });
+  const app = await buildServer(system, { config, repos: persistence?.repos });
   await app.listen({ port: config.port, host: "0.0.0.0" });
 
   let shuttingDown = false;
@@ -50,9 +58,16 @@ async function main(): Promise<void> {
     app.log.info(`received ${signal}, shutting down`);
     Promise.resolve()
       .then(async () => {
+        // recorder.stop() only clears its poll timer — it does not await any
+        // writes already in flight (all repo writes are fire-and-forget, see
+        // recorder.ts), so a handful of in-flight writes may still be
+        // pending when close() runs below. Acceptable for v1: those writes
+        // are typically sub-millisecond against pglite/pg, so in practice
+        // they settle well before close()/process.exit() actually run.
         recorder?.stop();
         await app.close();
         await system.stop();
+        await persistence?.close();
       })
       .then(
         () => process.exit(0),
