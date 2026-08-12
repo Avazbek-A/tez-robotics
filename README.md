@@ -15,18 +15,29 @@
 
 ## Tez Orchestrator (`packages/`)
 
-TypeScript monorepo implementing the real orchestration layer — robots connect as external clients over **VDA 5050 2.0 / MQTT**, so a physical AMR plugs in with zero core changes:
+TypeScript monorepo implementing the real orchestration layer — robots connect as external clients over **VDA 5050 2.0 / MQTT**, so a physical AMR plugs in with zero core changes. Package map (`packages/`):
 
+- **`@tez/shared`** — types and constants shared across every package (`RobotId`, `RobotState`, `CellKey`, `DEFAULT_MAP_ID`)
 - **`@tez/core`** — warehouse map graph, PIBT multi-robot router (scales to 1000+ agents, deadlock-resolving), cell-reservation table, Hungarian assignment dispatcher, transport-order state machine
 - **`@tez/robot-interface`** — protocol-agnostic adapter seam + real VDA 5050 adapter (built on the MIT-licensed Siemens `vda-5050-lib`); adapter architecture ready for vendor-specific protocols
 - **`@tez/orchestrator`** — the control loop: dispatch → route → reserve → execute, offline-robot recovery, quarantine, live KPIs
+- **`@tez/persistence`** — Postgres (and in-memory pglite) driver, migrations, and repos backing order/KPI history
+- **`@tez/api`** — Fastify REST + WebSocket API fronting the orchestrator (demo `FakeAdapter` mode or real VDA 5050 mode)
 - **`@tez/sim`** — simulated AMR fleet speaking real VDA 5050 over a real broker, failure-injection end-to-end soak tests
+- **`@tez/dashboard`** — React/PixiJS live fleet cockpit (RU/UZ/EN), consumes the api's WS stream
 
 149 tests including multi-minute fleet soaks with robot-failure injection. Known v1 limits are documented in [`docs/BACKLOG.md`](docs/BACKLOG.md).
 
 ```bash
 corepack pnpm install
 corepack pnpm -r test        # full suite incl. e2e soak (~10 min, serialized)
+```
+
+Full production build is two steps, in order — the dashboard's Vite production build resolves `@tez/core`/`@tez/shared` via their built `dist/`, not source, so it needs them built first:
+
+```bash
+corepack pnpm build                              # 7 node packages (dashboard excluded)
+corepack pnpm --filter @tez/dashboard build       # dashboard prod build, needs core/shared dist above
 ```
 
 ## Browser demo (`orchestrator-demo/`)
@@ -67,7 +78,7 @@ Persisted order/KPI history uses an in-memory pglite instance by default. Env va
 corepack pnpm demo:vda
 ```
 
-Same dashboard, but the api runs in real VDA 5050 mode against a local dev MQTT broker, with a 3-robot simulated fleet (`@tez/sim`) speaking the actual protocol instead of `FakeAdapter`. This path is **best-effort**: it depends on a dev MQTT broker and a simulated fleet process that can fail to start independently of the api/dashboard (see [`docs/BACKLOG.md`](docs/BACKLOG.md) for the known gaps — e.g. the sim fleet's AGV ids don't line up with the api's own robot ids yet). If the sim fleet fails to spawn, the api and dashboard still come up; you'll just see an empty fleet until robots connect.
+Same dashboard, but the api runs in real VDA 5050 mode against a local dev MQTT broker, with a 3-robot simulated fleet (`@tez/sim`) speaking the actual protocol instead of `FakeAdapter`. This path is **best-effort**: it depends on a dev MQTT broker and a simulated fleet process that can fail to start independently of the api/dashboard (see [`docs/BACKLOG.md`](docs/BACKLOG.md) for the known gaps). If the sim fleet fails to spawn, the api and dashboard still come up; you'll just see an empty fleet until robots connect.
 
 ## Why robots + local software
 

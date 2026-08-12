@@ -150,6 +150,15 @@ interface RobotRuntime {
   dispatchCooldownUntilTick?: number;
 }
 
+/**
+ * `RobotId` is defined twice in this codebase: a plain `string` alias in
+ * `@tez/shared` (used across the orchestrator/api/dashboard boundary) and a
+ * branded type in `@tez/core` (used internally by `OrderBook`/dispatch for
+ * nominal-typing safety). This cast is the accepted bridge between the two —
+ * unifying them was assessed and deferred (BACKLOG.md #11) as a risky
+ * refactor with no behavioral payoff; both aliases resolve to `string` at
+ * runtime, so the cast is a no-op cast, not a type-safety hole.
+ */
 function asCoreRobotId(id: RobotId): CoreRobotId {
   return id as CoreRobotId;
 }
