@@ -2,13 +2,20 @@
   "name": "@tez/sim",
   "version": "0.0.1",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "development": "./src/index.ts",
+      "default": "./dist/index.js"
+    }
+  },
   "bin": {
     "tez-sim": "dist/cli.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsup --config ../../tsup.config.ts",
     "test": "vitest run"
   },
   "dependencies": {
