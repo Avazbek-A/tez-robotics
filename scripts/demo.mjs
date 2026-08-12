@@ -320,7 +320,20 @@ async function main() {
   console.log(`[demo] starting api (${VDA ? "vda + dev broker" : "demo/FakeAdapter"}) on :${API_PORT}...`);
   const { child: apiChild, onLine: onApiLine } = spawnTeeing(
     "node",
-    ["--import", aedesShimImportUrl(), "--import", "tsx", "packages/api/dist/main.js"],
+    // --conditions=development: Task 4 (build pipeline) gave every sibling
+    // workspace package a conditional `exports` map — `development`
+    // (source, what vitest/Vite request automatically outside production
+    // mode) vs `default` (dist/, what a bare `node`/tsx process requests by
+    // default with no flag). Without this flag, this tsx-spawned process
+    // would resolve @tez/core, @tez/shared, @tez/orchestrator,
+    // @tez/persistence, @tez/robot-interface through `default` -> dist/,
+    // which (a) doesn't exist on a clean checkout until `pnpm build` has
+    // been run (undocumented prerequisite, ERR_MODULE_NOT_FOUND) and (b)
+    // once built, silently runs stale compiled output after any source
+    // edit — exactly what decision 6's "dev keeps tsx/vitest on src" is
+    // meant to prevent. This flag makes tsx's resolution match vitest's:
+    // both now request `development` and land on source.
+    ["--conditions=development", "--import", aedesShimImportUrl(), "--import", "tsx", "packages/api/dist/main.js"],
     { env: apiEnv },
   );
   track(apiChild);
@@ -405,10 +418,20 @@ async function main() {
       ].join("\n");
 
       const simChild = track(
-        spawn("node", ["--import", "tsx", "--input-type=module", "-e", simScript], {
-          cwd: ROOT,
-          stdio: "inherit",
-        }),
+        spawn(
+          "node",
+          // --conditions=development: same reasoning as the api spawn above
+          // — this inline script imports packages/sim/src/index.ts directly
+          // by path (see comment above simIndexPath), but that file itself
+          // imports @tez/core and @tez/shared as bare specifiers, which
+          // still go through package resolution and would otherwise land on
+          // dist/ instead of src/.
+          ["--conditions=development", "--import", "tsx", "--input-type=module", "-e", simScript],
+          {
+            cwd: ROOT,
+            stdio: "inherit",
+          },
+        ),
       );
       simChild.on("exit", (code) => {
         if (!shuttingDown) {
