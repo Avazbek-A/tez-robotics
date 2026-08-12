@@ -102,9 +102,12 @@ async function buildVdaSystem(config: ApiConfig, map: WarehouseMap, mapJson: unk
     throw new Error("vda mode requires mqttUrl or devBroker");
   }
 
+  // Serial scheme must match @tez/sim's spawnFleet (`sim-001..sim-00N`) —
+  // the adapter drops state/connection events from unconfigured serials
+  // (foreign-AGV guard), so a mismatch means robotsOnline stays 0 (BACKLOG #20).
   const agvIds = Array.from({ length: config.robots }, (_, i) => ({
     manufacturer: "tez",
-    serialNumber: `r${i + 1}`,
+    serialNumber: `sim-${String(i + 1).padStart(3, "0")}`,
   }));
   const adapter = new Vda5050Adapter(agvIds, mqttUrl);
   const orchestrator = new Orchestrator(map, adapter, { tickMs: config.tickMs });

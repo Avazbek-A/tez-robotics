@@ -78,7 +78,7 @@ Persisted order/KPI history uses an in-memory pglite instance by default. Env va
 corepack pnpm demo:vda
 ```
 
-Same dashboard, but the api runs in real VDA 5050 mode against a local dev MQTT broker, with a 3-robot simulated fleet (`@tez/sim`) speaking the actual protocol instead of `FakeAdapter`. This path is **best-effort**: it depends on a dev MQTT broker and a simulated fleet process that can fail to start independently of the api/dashboard (see [`docs/BACKLOG.md`](docs/BACKLOG.md) for the known gaps). If the sim fleet fails to spawn, the api and dashboard still come up; you'll just see an empty fleet until robots connect. Note: in `vda` mode the simulated fleet's ids (`sim-00N`) don't yet match the api's configured AGV serials (`r1..r3`), so connected sim robots are currently ignored as unconfigured AGVs — tracked in [`docs/BACKLOG.md`](docs/BACKLOG.md).
+Same dashboard, but the api runs in real VDA 5050 mode against a local dev MQTT broker, with a 3-robot simulated fleet (`@tez/sim`) speaking the actual protocol instead of `FakeAdapter`. This path is **best-effort**: it depends on a dev MQTT broker and a simulated fleet process that can fail to start independently of the api/dashboard (see [`docs/BACKLOG.md`](docs/BACKLOG.md) for the known gaps). If the sim fleet fails to spawn, the api and dashboard still come up; you'll just see an empty fleet until robots connect.
 
 ## Why robots + local software
 

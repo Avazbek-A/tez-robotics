@@ -359,23 +359,35 @@ async function main() {
   // stdout data event can possibly fire (that requires at least one more
   // turn of the event loop than this synchronous code takes). The promise
   // itself is only awaited later, once mqttUrl is actually needed.
+  //
+  // The 5s fallback TIMER, by contrast, is armed only after waitForHealth()
+  // resolves (via armMqttFallback below) — arming it here at spawn time made
+  // it race the api's entire boot, so a slow machine could fall back to the
+  // hardcoded default port while the real BROKER_URL line was still on its
+  // way (BACKLOG #22). Post-health, the countdown races only the log line.
   let mqttUrlPromise;
+  let armMqttFallback = () => {};
   if (VDA) {
     mqttUrlPromise = new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        console.warn(
-          "[demo] no BROKER_URL=<url> line seen from the api within 5s; " +
-            "assuming the dev broker's default mqtt://localhost:1883",
-        );
-        resolve("mqtt://localhost:1883");
-      }, 5000);
+      let resolved = false;
       onApiLine((line) => {
         const match = line.match(/BROKER_URL=(\S+)/);
         if (match) {
-          clearTimeout(timer);
+          resolved = true;
           resolve(match[1]);
         }
       });
+      armMqttFallback = () => {
+        if (resolved) return;
+        setTimeout(() => {
+          if (resolved) return;
+          console.warn(
+            "[demo] no BROKER_URL=<url> line seen from the api within 5s of /health; " +
+              "assuming the dev broker's default mqtt://localhost:1883",
+          );
+          resolve("mqtt://localhost:1883");
+        }, 5000);
+      };
     });
   }
 
@@ -384,6 +396,7 @@ async function main() {
   console.log(`[demo] api healthy:`, health);
 
   if (VDA) {
+    armMqttFallback();
     const mqttUrl = await mqttUrlPromise;
 
     console.log(`[demo] building @tez/sim (best-effort)...`);
