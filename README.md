@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/Avazbek-A/tez-robotics/actions/workflows/ci.yml/badge.svg)](https://github.com/Avazbek-A/tez-robotics/actions/workflows/ci.yml)
 
+**[▶ Live browser demo](https://avazbek-a.github.io/tez-robotics/)** — warehouse simulation: task allocation, routing, conflict resolution, live KPIs. No install.
+
 **Warehouse robotics for Uzbekistan & Central Asia** — AMR fleet integration plus our own orchestration platform with native 1C/WMS integration.
 
 > Uzbekistan has zero local warehouse-robotics integrators. When the country's largest marketplace robotized its warehouse, the contractor had to come from abroad. Tez Robotics is building the local layer: deployment, orchestration software, and 24/7 on-site service.
